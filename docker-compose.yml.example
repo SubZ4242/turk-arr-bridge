@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  turk-arr-bridge:
+    build: .
+    container_name: turk-arr-bridge
+    restart: unless-stopped
+    ports:
+      - "9696:9696"
+    environment:
+      # Sonarr Konfiguration
+      - SONARR_URL=http://YOUR_NAS_IP:PORT
+      - SONARR_API_KEY=your_sonarr_api_key
+      
+      # Radarr Konfiguration
+      - RADARR_URL=http://YOUR_NAS_IP:PORT
+      - RADARR_API_KEY=your_radarr_api_key
+      
+      # Jackett Konfiguration
+      - JACKETT_URL=http://YOUR_NAS_IP:PORT
+      - JACKETT_API_KEY=your_jackett_api_key
+      
+      # Upstream Torznab (das echte Jackett TürkTorrent Endpoint)
+      - UPSTREAM_TORZNAB_URL=http://YOUR_NAS_IP:PORT/api/v2.0/indexers/turktorrent/results/torznab/
+      
+      # Bridge Einstellungen
+      - BRIDGE_PORT=9696
+      - CACHE_TTL_SECONDS=300
+      - LOG_LEVEL=INFO
+    
+    # Netzwerk - Host-Modus um alle lokalen Services zu erreichen
+    network_mode: host
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9696/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

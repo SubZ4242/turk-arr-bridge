@@ -1,0 +1,32 @@
+# Credentials & sensible Dateien – niemals ins Repository
+.env
+*.env
+
+# docker-compose.yml enthält echte IPs & API Keys → lokal behalten
+# Vorlage: docker-compose.yml.example
+turk_arr_bridge/docker-compose.yml
+
+# Nur turk_arr_bridge/ gehört ins Repo – alles andere ignorieren
+index.js
+Daten.md
+push_zu_git.sh
+deploy_nas.sh
+deploy_github_zu_nas.sh
+deploy_github.sh
+Qbit Notifier/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+
+# Config-Datei mit gespeicherten Werten
+bridge_config.json
+/config/
+
+# Logs
+*.log
+
+# macOS
+.DS_Store
