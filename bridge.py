@@ -70,7 +70,7 @@ _DEFAULT_CONFIG = {
     "turktorrent_cookie_status": "",
     "turktorrent_current_cookie": "",
     "bridge_external_url": "",
-    "flaresolverr_url": "http://192.168.178.76:30198",
+    "flaresolverr_url": "",
 }
 
 
@@ -145,7 +145,7 @@ TURKTORRENT_COOKIE_AUTO_REFRESH = _config.get("turktorrent_cookie_auto_refresh",
 TURKTORRENT_COOKIE_INTERVAL = int(_config.get("turktorrent_cookie_interval_minutes", 120))
 TURKTORRENT_SITE_URL = _config.get("turktorrent_site_url", "https://turktorrent.us")
 TURKTORRENT_JACKETT_INDEXER_ID = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
-FLARESOLVERR_URL = _config.get("flaresolverr_url", "http://192.168.178.76:30198")
+FLARESOLVERR_URL = _config.get("flaresolverr_url", "")
 
 # ============================================================
 # TurkTorrent Cookie-Auto-Refresh (via FlareSolverr + manuelles hCaptcha per Telegram)
@@ -176,7 +176,16 @@ def _request_manual_captcha(site_url: str, timeout_minutes: int = 10) -> dict:
         bridge_host = _config.get("bridge_external_url", "").rstrip("/")
         if not bridge_host:
             # Fallback: lokale IP + Port
-            bridge_host = f"http://192.168.178.76:{_config.get('bridge_port', 9696)}"
+            # Fallback: versuche eigene IP zu ermitteln
+            import socket as _sock
+            try:
+                _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+                _s.connect(("8.8.8.8", 80))
+                _local_ip = _s.getsockname()[0]
+                _s.close()
+            except Exception:
+                _local_ip = "127.0.0.1"
+            bridge_host = f"http://{_local_ip}:{_config.get('bridge_port', 9696)}"
 
         captcha_url = f"{bridge_host}/captcha"
         print(f"[CAPTCHA] hCaptcha-Lösung benötigt! Link: {captcha_url}")
@@ -221,7 +230,10 @@ def _turktorrent_login(username: str, password: str, site_url: str, flaresolverr
     Gibt {"ok": bool, "cookie": str, "user_agent": str, "error": str} zurück.
     """
     if not flaresolverr_url:
-        flaresolverr_url = _config.get("flaresolverr_url", "http://192.168.178.76:30198")
+        flaresolverr_url = _config.get("flaresolverr_url", "")
+
+    if not flaresolverr_url:
+        return {"ok": False, "cookie": "", "user_agent": "", "error": "FlareSolverr URL nicht konfiguriert – bitte in der GUI unter Einstellungen eintragen"}
 
     fs_api = f"{flaresolverr_url.rstrip('/')}/v1"
     session_id = f"turktorrent_{int(time.time())}"
@@ -482,7 +494,7 @@ def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: s
     if not cookie:
         return {"ok": False, "error": "Keine Cookie vorhanden"}
     if not flaresolverr_url:
-        flaresolverr_url = _config.get("flaresolverr_url", "http://192.168.178.76:30198")
+        flaresolverr_url = _config.get("flaresolverr_url", "")
 
     try:
         # Versuche direkt mit den Cookies (ohne FlareSolverr) – schneller
@@ -2421,7 +2433,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
 <div>
-<div class="field"><label>🤖 FlareSolverr URL</label><input id="cfg_flaresolverr_url" placeholder="http://192.168.178.76:30198"></div>
+<div class="field"><label>🤖 FlareSolverr URL</label><input id="cfg_flaresolverr_url" placeholder="http://localhost:8191"></div>
 <div class="field"><label>👤 TurkTorrent Benutzername</label><input id="cfg_turktorrent_username" placeholder="dein TurkTorrent Username"></div>
 <div class="field"><label>🔑 TurkTorrent Passwort</label><input id="cfg_turktorrent_password" type="password" placeholder="dein TurkTorrent Passwort"></div>
 </div>
@@ -4041,7 +4053,7 @@ def gui_save_config():
     TURKTORRENT_COOKIE_INTERVAL = int(_config.get("turktorrent_cookie_interval_minutes", 120))
     TURKTORRENT_SITE_URL = _config.get("turktorrent_site_url", "https://turktorrent.us")
     TURKTORRENT_JACKETT_INDEXER_ID = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
-    FLARESOLVERR_URL = _config.get("flaresolverr_url", "http://192.168.178.76:30198")
+    FLARESOLVERR_URL = _config.get("flaresolverr_url", "")
     title_cache.ttl = CACHE_TTL_SECONDS
     title_cache._last_refresh = None  # Force refresh
     logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
@@ -4251,7 +4263,7 @@ def gui_restore():
         TURKTORRENT_COOKIE_INTERVAL = int(_config.get("turktorrent_cookie_interval_minutes", 120))
         TURKTORRENT_SITE_URL = _config.get("turktorrent_site_url", "https://turktorrent.us")
         TURKTORRENT_JACKETT_INDEXER_ID = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
-        FLARESOLVERR_URL = _config.get("flaresolverr_url", "http://192.168.178.76:30198")
+        FLARESOLVERR_URL = _config.get("flaresolverr_url", "")
         TWOCAPTCHA_API_KEY = _config.get("twocaptcha_api_key", "")
         title_cache.ttl = CACHE_TTL_SECONDS
         title_cache._last_refresh = None

@@ -13,7 +13,15 @@ push_zu_git.sh
 deploy_nas.sh
 deploy_github_zu_nas.sh
 deploy_github.sh
+deploy.sh
+
+# Stack/Compose mit echten IPs & API Keys → lokal behalten
+# Vorlage: portainer-stack.yml.example
+portainer-stack.yml
 Qbit Notifier/
+
+# Debug Scripts
+debug_login.py
 
 # Python
 __pycache__/

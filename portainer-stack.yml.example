@@ -1,14 +1,14 @@
 version: "3.8"
 
 # ============================================================
-# Türk ARR Bridge - Portainer Stack
+# Türk ARR Bridge - Portainer Stack (VORLAGE)
 # ============================================================
-# Torznab-Proxy der internationale Titel automatisch
-# in türkische Originaltitel übersetzt.
+# Kopiere diese Datei als portainer-stack.yml und passe die
+# Werte an deine Umgebung an.
 #
 # Nach dem Deploy in Sonarr/Radarr die Indexer-URL ändern:
-#   ALT:  http://192.168.178.76:30196/api/v2.0/indexers/turktorrent/results/torznab/
-#   NEU:  http://192.168.178.76:9696/torznab
+#   ALT:  http://<DEINE_IP>:<JACKETT_PORT>/api/v2.0/indexers/turktorrent/results/torznab/
+#   NEU:  http://<DEINE_IP>:9696/torznab
 # ============================================================
 
 services:
@@ -19,20 +19,20 @@ services:
     ports:
       - "9696:9696"
     environment:
-      # Sonarr Konfiguration (Türk-Instanz auf Port 30199)
-      SONARR_URL: "http://192.168.178.76:30199"
-      SONARR_API_KEY: "e4a818c5f4b545f98704459811912fa7"
+      # Sonarr Konfiguration
+      SONARR_URL: "http://<DEINE_IP>:<SONARR_PORT>"
+      SONARR_API_KEY: "<DEIN_SONARR_API_KEY>"
       
-      # Radarr Konfiguration (Türk-Instanz auf Port 30095)
-      RADARR_URL: "http://192.168.178.76:30095"
-      RADARR_API_KEY: "157cffb2534a4171a84e36df111307e0"
+      # Radarr Konfiguration
+      RADARR_URL: "http://<DEINE_IP>:<RADARR_PORT>"
+      RADARR_API_KEY: "<DEIN_RADARR_API_KEY>"
       
       # Jackett Konfiguration
-      JACKETT_URL: "http://192.168.178.76:30196"
-      JACKETT_API_KEY: "9kyp7kl9ofqxa8r02mkvpr5msykqytzy"
+      JACKETT_URL: "http://<DEINE_IP>:<JACKETT_PORT>"
+      JACKETT_API_KEY: "<DEIN_JACKETT_API_KEY>"
       
       # Upstream: Das echte Jackett/TürkTorrent Torznab-Endpoint
-      UPSTREAM_TORZNAB_URL: "http://192.168.178.76:30196/api/v2.0/indexers/turktorrent/results/torznab/"
+      UPSTREAM_TORZNAB_URL: "http://<DEINE_IP>:<JACKETT_PORT>/api/v2.0/indexers/turktorrent/results/torznab/"
       
       # Bridge Einstellungen
       BRIDGE_PORT: "9696"
