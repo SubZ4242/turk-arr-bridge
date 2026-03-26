@@ -75,17 +75,13 @@ _DEFAULT_CONFIG = {
 
 
 def _load_config() -> dict:
-    """Lade Config: JSON-Datei > Env-Vars > Defaults."""
+    """Lade Config: JSON-Datei > Env-Vars > Defaults.
+    Wichtig: Für Felder die der User über die GUI ändert (z.B. Telegram),
+    hat die JSON-Datei Vorrang über Env-Vars, damit GUI-Änderungen nicht
+    bei jedem Restart von alten Env-Vars überschrieben werden.
+    """
     cfg = dict(_DEFAULT_CONFIG)
-    # JSON-Datei laden, falls vorhanden
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                saved = json.load(f)
-            cfg.update({k: v for k, v in saved.items() if v is not None and v != ""})
-    except Exception as e:
-        print(f"[CONFIG] Fehler beim Laden von {CONFIG_FILE}: {e}")
-    # Env-Vars haben höchste Priorität
+    # Env-Vars als Basis (niedrigere Priorität als JSON-Datei)
     env_map = {
         "SONARR_URL": "sonarr_url", "SONARR_API_KEY": "sonarr_api_key",
         "RADARR_URL": "radarr_url", "RADARR_API_KEY": "radarr_api_key",
@@ -105,6 +101,14 @@ def _load_config() -> dict:
                 cfg[cfg_key] = int(val)
             else:
                 cfg[cfg_key] = val
+    # JSON-Datei hat höchste Priorität (GUI-Änderungen überschreiben Env-Vars)
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                saved = json.load(f)
+            cfg.update({k: v for k, v in saved.items() if v is not None and v != ""})
+    except Exception as e:
+        print(f"[CONFIG] Fehler beim Laden von {CONFIG_FILE}: {e}")
     return cfg
 
 
@@ -485,43 +489,178 @@ def _cleanup_flaresolverr_session(fs_api: str, session_id: str):
         pass
 
 
+def _check_tsue_logged_in(html: str) -> bool:
+    """Prüft anhand von TSUE-Variablen im HTML ob der User eingeloggt ist."""
+    # TSUE setzt memberid: "0" und membername: "Guest" für nicht-eingeloggte User
+    mid_match = re.search(r'memberid:\s*"([^"]+)"', html)
+    mname_match = re.search(r'membername:\s*"([^"]+)"', html)
+    mid = mid_match.group(1) if mid_match else "0"
+    mname = mname_match.group(1) if mname_match else "Guest"
+
+    if mid not in ("0", "?", "") and mname not in ("Guest", "?", ""):
+        return True
+
+    # Fallback: Logout-Link auf der Seite
+    if "member.php?action=logout" in html.lower() or "çıkış" in html.lower():
+        return True
+
+    return False
+
+
 def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: str = "") -> dict:
     """
     Prüft ob eine TurkTorrent-Cookie noch gültig ist.
-    Versucht eine geschützte Seite zu laden und prüft ob wir eingeloggt sind.
-    Gibt {"ok": bool, "error": str} zurück.
+    Strategie:
+      1. Versuche direkt (ohne FlareSolverr) – schnell, klappt wenn cf_clearance noch gültig
+      2. Falls Cloudflare blockt (403/503) → FlareSolverr holt frischen cf_clearance,
+         dann nochmal mit tsue_member + frischem cf_clearance prüfen.
+         So wird nur bei echtem tsue_member-Ablauf ein neues Captcha nötig.
+    Gibt {"ok": bool, "error": str, "fresh_cf_clearance": str} zurück.
     """
     if not cookie:
-        return {"ok": False, "error": "Keine Cookie vorhanden"}
+        return {"ok": False, "error": "Keine Cookie vorhanden", "fresh_cf_clearance": ""}
     if not flaresolverr_url:
         flaresolverr_url = _config.get("flaresolverr_url", "")
 
+    # Validierungs-URL: Homepage statt usercp.php (TSUE hat kein usercp.php!)
+    # Die Homepage enthält TSUESettings mit memberid/membername → eingeloggt oder nicht
+    test_url = f"{site_url.rstrip('/')}/"
+    default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+    # ── Versuch 1: Direkt mit vorhandenen Cookies (schnell) ──
+    cloudflare_block = False
     try:
-        # Versuche direkt mit den Cookies (ohne FlareSolverr) – schneller
-        test_url = f"{site_url.rstrip('/')}/usercp.php"
         headers = {
             "Cookie": cookie,
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            "User-Agent": default_ua
         }
-        resp = requests.get(test_url, headers=headers, timeout=15, allow_redirects=False)
+        # allow_redirects=True, weil TSUE die Homepage auf ?p=home&pid=1 weiterleitet
+        resp = requests.get(test_url, headers=headers, timeout=15, allow_redirects=True)
+        resp_text = resp.text[:3000]
+        final_url = str(resp.url)
 
-        # Wenn 200 und keine Redirect auf Login → Cookie ist gültig
-        if resp.ok and "login" not in resp.headers.get("Location", "").lower():
-            return {"ok": True, "error": ""}
+        # Cloudflare-Erkennung: Challenge-Seite, cf-Elemente, Turnstile, etc.
+        is_cloudflare = (
+            resp.status_code in (403, 503)
+            or "challenge" in resp_text.lower()
+            or "cf-" in resp_text[:500].lower()
+            or "cloudflare" in resp_text.lower()
+            or "Just a moment" in resp_text
+            or "_cf_chl" in resp_text
+        )
 
-        # Wenn Redirect auf Login → Cookie abgelaufen
-        if resp.status_code in (301, 302, 303, 307, 308):
-            loc = resp.headers.get("Location", "")
-            if "login" in loc.lower():
-                return {"ok": False, "error": "Cookie abgelaufen – Redirect auf Login"}
-
-        # Bei 403 (Cloudflare) können wir nicht sicher sagen ob Cookie gültig
-        if resp.status_code == 403:
-            return {"ok": True, "error": "Cloudflare-Block – Cookie-Status unklar"}
-
-        return {"ok": False, "error": f"HTTP {resp.status_code}"}
+        if is_cloudflare:
+            print(f"[COOKIE] Direkter Zugriff → Cloudflare-Block (HTTP {resp.status_code})")
+            cloudflare_block = True
+        elif resp.ok:
+            # Homepage geladen – prüfe ob eingeloggt via TSUE-Variablen
+            logged_in = _check_tsue_logged_in(resp_text)
+            if logged_in:
+                return {"ok": True, "error": "", "fresh_cf_clearance": ""}
+            else:
+                return {"ok": False, "error": "Cookie abgelaufen – nicht eingeloggt auf Homepage", "fresh_cf_clearance": ""}
+        else:
+            # Unerwarteter Status → als Cloudflare-Block behandeln
+            print(f"[COOKIE] Direkter Zugriff → unerwarteter HTTP {resp.status_code}, versuche FlareSolverr")
+            cloudflare_block = True
+    except requests.exceptions.ConnectionError:
+        print("[COOKIE] Direkter Zugriff → ConnectionError, versuche FlareSolverr")
+        cloudflare_block = True
     except Exception as e:
-        return {"ok": False, "error": str(e)[:100]}
+        print(f"[COOKIE] Direkter Zugriff → Fehler: {e}, versuche FlareSolverr")
+        cloudflare_block = True
+
+    # ── Versuch 2: FlareSolverr für frischen cf_clearance, dann mit tsue_member prüfen ──
+    if cloudflare_block and flaresolverr_url:
+        print("[COOKIE] Cloudflare blockiert direkten Zugriff – hole frischen cf_clearance via FlareSolverr...")
+        try:
+            fs_api = f"{flaresolverr_url.rstrip('/')}/v1"
+            session_id = f"validate_{int(time.time())}"
+            requests.post(fs_api, json={"cmd": "sessions.create", "session": session_id}, timeout=10)
+
+            resp_fs = requests.post(fs_api, json={
+                "cmd": "request.get",
+                "url": site_url.rstrip("/") + "/",
+                "session": session_id,
+                "maxTimeout": 60000,
+            }, timeout=90)
+
+            # Session sofort aufräumen
+            _cleanup_flaresolverr_session(fs_api, session_id)
+
+            if resp_fs.ok:
+                data = resp_fs.json()
+                if data.get("status") == "ok":
+                    solution = data.get("solution", {})
+                    fs_cookies = {c["name"]: c["value"] for c in solution.get("cookies", []) if c.get("name") and c.get("value")}
+                    new_cf_clearance = fs_cookies.get("cf_clearance", "")
+                    new_ua = solution.get("userAgent", "")
+
+                    if new_cf_clearance:
+                        print(f"[COOKIE] Frischer cf_clearance erhalten: {new_cf_clearance[:30]}...")
+
+                        # Cookie-String aktualisieren: alten cf_clearance ersetzen
+                        cookie_parts = {}
+                        for part in cookie.split(";"):
+                            part = part.strip()
+                            if "=" in part:
+                                k, v = part.split("=", 1)
+                                cookie_parts[k.strip()] = v.strip()
+                        cookie_parts["cf_clearance"] = new_cf_clearance
+                        updated_cookie = "; ".join(f"{k}={v}" for k, v in cookie_parts.items())
+                        use_ua = new_ua or default_ua
+
+                        # Jetzt mit frischem cf_clearance + altem tsue_member nochmal prüfen
+                        headers2 = {
+                            "Cookie": updated_cookie,
+                            "User-Agent": use_ua
+                        }
+                        print(f"[COOKIE] Teste tsue_member mit frischem cf_clearance...")
+                        resp2 = requests.get(test_url, headers=headers2, timeout=15, allow_redirects=True)
+                        resp2_text = resp2.text[:3000]
+                        print(f"[COOKIE] Validierung nach cf_clearance-Refresh: HTTP {resp2.status_code}, URL: {resp2.url}")
+
+                        # Cloudflare-Check (sollte jetzt nicht mehr kommen)
+                        is_cf2 = "challenge" in resp2_text.lower() or "Just a moment" in resp2_text
+                        
+                        if is_cf2:
+                            print(f"[COOKIE] ⚠️ Auch nach cf_clearance-Refresh noch Cloudflare-Block")
+                            return {"ok": False, "error": "Cloudflare-Block trotz frischem cf_clearance", "fresh_cf_clearance": new_cf_clearance}
+
+                        if resp2.ok:
+                            # Homepage geladen – prüfe TSUE-Login-Status
+                            logged_in = _check_tsue_logged_in(resp2.text)
+                            if logged_in:
+                                print("[COOKIE] ✅ tsue_member noch gültig! Nur cf_clearance war abgelaufen.")
+                                _config["turktorrent_current_cookie"] = updated_cookie
+                                if new_ua:
+                                    _config["turktorrent_current_user_agent"] = new_ua
+                                _save_config(_config)
+                                print("[COOKIE] Aktualisiere Jackett mit frischem cf_clearance...")
+                                _update_jackett_indexer_cookie(updated_cookie, use_ua)
+                                return {"ok": True, "error": "", "fresh_cf_clearance": new_cf_clearance}
+                            else:
+                                # TSUE sagt nicht eingeloggt → tsue_member wirklich abgelaufen
+                                _mid = re.search(r'memberid:\s*"([^"]+)"', resp2.text)
+                                _mname = re.search(r'membername:\s*"([^"]+)"', resp2.text)
+                                mid = _mid.group(1) if _mid else "?"
+                                mname = _mname.group(1) if _mname else "?"
+                                print(f"[COOKIE] ❌ tsue_member abgelaufen (memberid={mid}, membername={mname})")
+                                return {"ok": False, "error": f"Cookie abgelaufen – memberid={mid}, membername={mname}", "fresh_cf_clearance": new_cf_clearance}
+
+                        return {"ok": False, "error": f"HTTP {resp2.status_code} nach cf_clearance-Refresh", "fresh_cf_clearance": new_cf_clearance}
+
+            print(f"[COOKIE] FlareSolverr konnte cf_clearance nicht erneuern (FlareSolverr HTTP {resp_fs.status_code if 'resp_fs' in dir() else '?'})")
+        except Exception as e:
+            print(f"[COOKIE] FlareSolverr-Validierung fehlgeschlagen: {e}")
+            import traceback
+            traceback.print_exc()
+
+    # Fallback: kein FlareSolverr oder FlareSolverr auch fehlgeschlagen
+    if not flaresolverr_url:
+        return {"ok": True, "error": "Cloudflare-Block, kein FlareSolverr – Status unklar", "fresh_cf_clearance": ""}
+
+    return {"ok": False, "error": "Cloudflare-Block, cf_clearance konnte nicht erneuert werden", "fresh_cf_clearance": ""}
 
 
 def _get_jackett_session(jackett_url: str, admin_password: str) -> requests.Session:
@@ -619,12 +758,17 @@ def _send_telegram_alert(message: str):
         chat_id = _config.get("telegram_chat_id", "")
         enabled = _config.get("telegram_enabled", True)
         if not token or not chat_id or not enabled:
+            print(f"[TELEGRAM] Übersprungen (enabled={enabled}, token={'ja' if token else 'NEIN'}, chat_id={'ja' if chat_id else 'NEIN'})")
             return
-        requests.post(
+        resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": f"🍪 Turk ARR Bridge\n\n{message}", "parse_mode": "HTML"},
             timeout=10,
         )
+        if resp.ok:
+            print(f"[TELEGRAM] ✅ Nachricht gesendet")
+        else:
+            print(f"[TELEGRAM] ❌ API-Fehler: {resp.status_code} – {resp.text[:150]}")
     except Exception as e:
         print(f"[TELEGRAM] Alert fehlgeschlagen: {e}")
 
@@ -715,6 +859,12 @@ def _cookie_refresh_loop():
 
             if not (enabled and username and password and flaresolverr_url):
                 time.sleep(CHECK_INTERVAL)
+                continue
+
+            # Wenn gerade ein Captcha-Request läuft, nicht stören
+            if _captcha_request_active:
+                print(f"[COOKIE] ⏳ Captcha-Request läuft, warte...")
+                time.sleep(60)  # kürzeres Intervall, damit wir schnell reagieren
                 continue
 
             # Cookie validieren
