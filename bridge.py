@@ -64,11 +64,13 @@ _DEFAULT_CONFIG = {
     "turktorrent_cookie_auto_refresh": True,
     "turktorrent_cookie_interval_minutes": 120,
     "turktorrent_site_url": "https://turktorrent.us",
+    "jackett_admin_password": "",
     "turktorrent_jackett_indexer_id": "turktorrent",
     "turktorrent_last_cookie_refresh": "",
     "turktorrent_cookie_status": "",
+    "turktorrent_current_cookie": "",
+    "bridge_external_url": "",
     "flaresolverr_url": "http://192.168.178.76:30198",
-    "twocaptcha_api_key": "",
 }
 
 
@@ -88,6 +90,7 @@ def _load_config() -> dict:
         "SONARR_URL": "sonarr_url", "SONARR_API_KEY": "sonarr_api_key",
         "RADARR_URL": "radarr_url", "RADARR_API_KEY": "radarr_api_key",
         "JACKETT_URL": "jackett_url", "JACKETT_API_KEY": "jackett_api_key",
+        "JACKETT_ADMIN_PASSWORD": "jackett_admin_password",
         "UPSTREAM_TORZNAB_URL": "upstream_torznab_url",
         "QBIT_URL": "qbit_url", "QBIT_USER": "qbit_user", "QBIT_PASS": "qbit_pass",
         "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
@@ -143,84 +146,88 @@ TURKTORRENT_COOKIE_INTERVAL = int(_config.get("turktorrent_cookie_interval_minut
 TURKTORRENT_SITE_URL = _config.get("turktorrent_site_url", "https://turktorrent.us")
 TURKTORRENT_JACKETT_INDEXER_ID = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
 FLARESOLVERR_URL = _config.get("flaresolverr_url", "http://192.168.178.76:30198")
-TWOCAPTCHA_API_KEY = _config.get("twocaptcha_api_key", "")
 
 # ============================================================
-# TurkTorrent Cookie-Auto-Refresh (via FlareSolverr + 2captcha)
+# TurkTorrent Cookie-Auto-Refresh (via FlareSolverr + manuelles hCaptcha per Telegram)
 # ============================================================
 
 _cookie_refresh_lock = threading.Lock()
 _cookie_refresh_thread: Optional[threading.Thread] = None
 
+# Manuelles hCaptcha: Bridge wartet auf Token vom User (via Telegram-Link)
+_pending_captcha_token: Optional[str] = None
+_pending_captcha_event = threading.Event()
+_captcha_request_active = False  # True wenn auf Captcha gewartet wird
 
-def _solve_hcaptcha(site_key: str, page_url: str, api_key: str) -> dict:
+
+def _request_manual_captcha(site_url: str, timeout_minutes: int = 10) -> dict:
     """
-    Löst hCaptcha via 2captcha API.
+    Fordert den User per Telegram auf, hCaptcha manuell zu lösen.
+    Wartet bis der Token über /captcha-callback eingeht.
     Gibt {"ok": bool, "token": str, "error": str} zurück.
     """
+    global _pending_captcha_token, _captcha_request_active
+    _pending_captcha_token = None
+    _pending_captcha_event.clear()
+    _captcha_request_active = True
+
     try:
-        print(f"[CAPTCHA] Sende hCaptcha an 2captcha (sitekey={site_key[:20]}...)")
-        # Task einreichen
-        submit = requests.post(
-            "https://2captcha.com/in.php",
-            data={
-                "key": api_key,
-                "method": "hcaptcha",
-                "sitekey": site_key,
-                "pageurl": page_url,
-                "json": 1,
-            },
-            timeout=30,
+        # Bridge-URL ermitteln (für den Telegram-Link)
+        bridge_host = _config.get("bridge_external_url", "").rstrip("/")
+        if not bridge_host:
+            # Fallback: lokale IP + Port
+            bridge_host = f"http://192.168.178.76:{_config.get('bridge_port', 9696)}"
+
+        captcha_url = f"{bridge_host}/captcha"
+        print(f"[CAPTCHA] hCaptcha-Lösung benötigt! Link: {captcha_url}")
+
+        # Telegram-Nachricht senden
+        _send_telegram_alert(
+            f"🔐 <b>hCaptcha-Lösung benötigt!</b>\n\n"
+            f"TurkTorrent Session abgelaufen.\n"
+            f"Bitte Captcha lösen (max. {timeout_minutes} Min):\n\n"
+            f"👉 <a href=\"{captcha_url}\">Captcha jetzt lösen</a>"
         )
-        result = submit.json()
-        if result.get("status") != 1:
-            return {"ok": False, "token": "", "error": f"2captcha Einreichung fehlgeschlagen: {result.get('request', 'Unbekannt')}"}
 
-        task_id = result["request"]
-        print(f"[CAPTCHA] Task eingereicht: {task_id}, warte auf Lösung...")
+        # Warte auf Token (max. timeout_minutes)
+        print(f"[CAPTCHA] Warte auf manuelle Lösung (max. {timeout_minutes} Min)...")
+        resolved = _pending_captcha_event.wait(timeout=timeout_minutes * 60)
 
-        # Auf Lösung warten (max. 2 Minuten)
-        for attempt in range(24):  # 24 * 5s = 120s
-            time.sleep(5)
-            check = requests.get(
-                f"https://2captcha.com/res.php?key={api_key}&action=get&id={task_id}&json=1",
-                timeout=15,
-            )
-            check_data = check.json()
-            if check_data.get("status") == 1:
-                token = check_data["request"]
-                print(f"[CAPTCHA] hCaptcha gelöst! Token: {token[:30]}...")
-                return {"ok": True, "token": token, "error": ""}
-            if check_data.get("request") != "CAPCHA_NOT_READY":
-                return {"ok": False, "token": "", "error": f"2captcha Fehler: {check_data.get('request', 'Unbekannt')}"}
-            print(f"[CAPTCHA] Noch nicht fertig (Versuch {attempt + 1}/24)...")
-
-        return {"ok": False, "token": "", "error": "2captcha Timeout nach 120s"}
+        if resolved and _pending_captcha_token:
+            token = _pending_captcha_token
+            print(f"[CAPTCHA] ✅ Token erhalten! ({token[:30]}...)")
+            return {"ok": True, "token": token, "error": ""}
+        else:
+            print("[CAPTCHA] ❌ Timeout – keine Lösung erhalten.")
+            _send_telegram_alert(f"⏰ <b>Captcha-Timeout!</b>\nKeine Lösung innerhalb von {timeout_minutes} Minuten erhalten.")
+            return {"ok": False, "token": "", "error": f"Captcha-Timeout nach {timeout_minutes} Minuten – keine manuelle Lösung erhalten"}
     except Exception as e:
         return {"ok": False, "token": "", "error": str(e)[:200]}
+    finally:
+        _captcha_request_active = False
+        _pending_captcha_token = None
+        _pending_captcha_event.clear()
 
 
-def _turktorrent_login(username: str, password: str, site_url: str, flaresolverr_url: str = "", twocaptcha_key: str = "") -> dict:
+def _turktorrent_login(username: str, password: str, site_url: str, flaresolverr_url: str = "", captcha_token: str = "") -> dict:
     """
     Loggt sich bei TurkTorrent ein:
     1. FlareSolverr holt cf_clearance Cookie (Cloudflare umgehen)
-    2. 2captcha löst hCaptcha (sitekey: 18b46fe7-6021-408e-b14c-f318dbae672a)
-    3. Direkter POST mit cf_clearance + hCaptcha-Token
+    2. hCaptcha wird manuell gelöst (per Telegram-Link) oder Token direkt übergeben
+    3. Direkter HTTP-POST (requests) mit cf_clearance + stKey + Captcha-Token
+       → FlareSolverr's request.post kann nicht verwendet werden, da dessen data:text/html-Trick
+         den Seitenkontext verliert und TurkTorrent den Login ignoriert.
+    4. Cookies aus Set-Cookie-Headers extrahieren
     Gibt {"ok": bool, "cookie": str, "user_agent": str, "error": str} zurück.
     """
     if not flaresolverr_url:
         flaresolverr_url = _config.get("flaresolverr_url", "http://192.168.178.76:30198")
-    if not twocaptcha_key:
-        twocaptcha_key = _config.get("twocaptcha_api_key", "")
-
-    if not twocaptcha_key:
-        return {"ok": False, "cookie": "", "user_agent": "", "error": "2captcha API Key nicht konfiguriert – benötigt um hCaptcha zu lösen"}
 
     fs_api = f"{flaresolverr_url.rstrip('/')}/v1"
     session_id = f"turktorrent_{int(time.time())}"
 
     try:
-        # ── Schritt 1: FlareSolverr → cf_clearance Cookie holen ──
+        # ── Schritt 1: FlareSolverr → cf_clearance Cookie + User-Agent holen ──
         print("[COOKIE] Schritt 1: FlareSolverr – Cloudflare-Challenge lösen...")
         requests.post(fs_api, json={"cmd": "sessions.create", "session": session_id}, timeout=15)
 
@@ -244,70 +251,214 @@ def _turktorrent_login(username: str, password: str, site_url: str, flaresolverr
         user_agent = solution1.get("userAgent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
         fs_cookies = {c["name"]: c["value"] for c in solution1.get("cookies", []) if c.get("name") and c.get("value")}
         cf_clearance = fs_cookies.get("cf_clearance", "")
+        page_html = solution1.get("response", "")
 
         if not cf_clearance:
             _cleanup_flaresolverr_session(fs_api, session_id)
             return {"ok": False, "cookie": "", "user_agent": "", "error": "FlareSolverr hat kein cf_clearance Cookie geliefert"}
 
         print(f"[COOKIE] cf_clearance erhalten: {cf_clearance[:30]}...")
+
+        # stKey aus der Seite extrahieren (CSRF-Token, benötigt für Login)
+        stkey_match = re.search(r'stKey:\s*"([^"]+)"', page_html)
+        stkey_from_flare = stkey_match.group(1) if stkey_match else ""
+        print(f"[COOKIE] stKey aus FlareSolverr-Seite: {stkey_from_flare}")
+
+        # FlareSolverr-Session schließen (wird nicht mehr benötigt)
         _cleanup_flaresolverr_session(fs_api, session_id)
 
-        # ── Schritt 2: hCaptcha via 2captcha lösen ──
-        print("[COOKIE] Schritt 2: hCaptcha via 2captcha lösen...")
-        hcaptcha_sitekey = "18b46fe7-6021-408e-b14c-f318dbae672a"  # TurkTorrent hCaptcha
-        captcha_result = _solve_hcaptcha(hcaptcha_sitekey, site_url.rstrip("/") + "/", twocaptcha_key)
+        # ── Schritt 1b: Frischen stKey per direktem GET holen ──
+        # Der stKey ist IP- und zeitbasiert. Wir holen einen frischen per requests.
+        print("[COOKIE] Schritt 1b: Frischen stKey per direktem GET holen...")
+        http_session = requests.Session()
+        http_session.headers.update({
+            "User-Agent": user_agent,
+            "Referer": site_url.rstrip("/") + "/",
+            "Origin": site_url.rstrip("/"),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "tr,en-US;q=0.9,en;q=0.8,de;q=0.7",
+        })
+        http_session.cookies.set("cf_clearance", cf_clearance, domain=".turktorrent.us")
+
+        resp_get = http_session.get(site_url.rstrip("/") + "/", timeout=20)
+        stkey = ""
+        if resp_get.ok and "challenge" not in resp_get.text[:500].lower():
+            stkey_match2 = re.search(r'stKey:\s*"([^"]+)"', resp_get.text)
+            if stkey_match2:
+                stkey = stkey_match2.group(1)
+                print(f"[COOKIE] Frischer stKey: {stkey}")
+            else:
+                print("[COOKIE] WARNUNG: Kein stKey im HTML gefunden, verwende FlareSolverr-stKey")
+                stkey = stkey_from_flare
+        else:
+            # Cloudflare blockiert den direkten GET → FlareSolverr-stKey verwenden
+            print("[COOKIE] Cloudflare blockiert direkten GET, verwende FlareSolverr-stKey")
+            stkey = stkey_from_flare
+
+        if not stkey:
+            return {"ok": False, "cookie": "", "user_agent": "", "error": "Kein stKey (CSRF-Token) extrahiert – Login nicht möglich"}
+
+        # ── Schritt 2: hCaptcha lösen (manuell per Telegram oder direkt übergeben) ──
+        if captcha_token:
+            print(f"[COOKIE] Schritt 2: hCaptcha-Token direkt übergeben ({captcha_token[:30]}...)")
+            captcha_result = {"ok": True, "token": captcha_token, "error": ""}
+        else:
+            print("[COOKIE] Schritt 2: hCaptcha manuell lösen (Telegram)...")
+            captcha_result = _request_manual_captcha(site_url)
 
         if not captcha_result["ok"]:
             return {"ok": False, "cookie": "", "user_agent": "", "error": f"hCaptcha lösen fehlgeschlagen: {captcha_result['error']}"}
 
-        # ── Schritt 3: Login-POST direkt mit cf_clearance + hCaptcha-Token ──
-        print("[COOKIE] Schritt 3: Login-POST senden...")
-        sess = requests.Session()
-        sess.headers.update({
-            "User-Agent": user_agent,
-            "Referer": site_url.rstrip("/") + "/",
-            "Origin": site_url.rstrip("/"),
-        })
-        for name, value in fs_cookies.items():
-            sess.cookies.set(name, value, domain="turktorrent.us")
+        hcaptcha_token = captcha_result["token"]
 
-        login_resp = sess.post(
-            site_url.rstrip("/") + "/",
-            data={
-                "loginbox_membername": username,
-                "loginbox_password": password,
-                "loginbox_remember": "1",
-                "captcha": captcha_result["token"],
-                "h-captcha-response": captcha_result["token"],
-                "g-recaptcha-response": captcha_result["token"],
-            },
-            timeout=30,
-            allow_redirects=True,
+        # ── Schritt 3: AJAX-Login-POST an /ajax/login.php ──
+        # TurkTorrent TSUE nutzt jQuery AJAX für den Login (NICHT normalen Form-POST!):
+        #   $.ajax({url: '/ajax/login.php', data: 'action=login&...&securitytoken=stKey&captcha=...', ...})
+        # Die Cookies werden NICHT per Set-Cookie gesetzt, sondern der Server
+        # antwortet mit einer Erfolgs-/Fehlermeldung. Bei Erfolg macht das JS window.location.reload()
+        # und der Server erkennt den Login über die interne Session.
+        print("[COOKIE] Schritt 3: AJAX-Login-POST an /ajax/login.php...")
+        login_url = site_url.rstrip("/") + "/ajax/login.php"
+        build_query = (
+            "action=login"
+            "&loginbox_remember=true"
+            "&loginbox_membername=" + urllib.parse.quote(username, safe='')
+            + "&loginbox_password=" + urllib.parse.quote(password, safe='')
+            + "&securitytoken=" + stkey
+            + "&captcha=" + urllib.parse.quote(hcaptcha_token, safe='')
         )
 
-        if not login_resp.ok:
-            return {"ok": False, "cookie": "", "user_agent": "", "error": f"Login POST HTTP {login_resp.status_code}"}
+        # POST senden (wie jQuery AJAX)
+        resp_login = http_session.post(
+            login_url,
+            data=build_query,
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+                "X-Requested-With": "XMLHttpRequest",
+            },
+            timeout=30,
+            allow_redirects=False,
+        )
 
-        # Alle Cookies nach dem Login sammeln
-        all_cookies = dict(sess.cookies)
-        all_cookies.update(fs_cookies)  # cf_clearance ebenfalls behalten
+        print(f"[COOKIE] POST Status: {resp_login.status_code}")
+
+        # Set-Cookie-Headers extrahieren (Login-Cookies kommen als Set-Cookie!)
+        set_cookie_headers = resp_login.raw.headers.getlist("Set-Cookie")
+        print(f"[COOKIE] POST Set-Cookie Headers ({len(set_cookie_headers)}):")
+        for sc in set_cookie_headers[:10]:
+            print(f"[COOKIE]   {sc[:120]}")
+
+        # AJAX-Response analysieren
+        ajax_response = resp_login.text
+        print(f"[COOKIE] AJAX-Response ({len(ajax_response)} Zeichen): {ajax_response[:300]}")
+
+        # Prüfe auf TSUE AJAX-Fehler: "-ERROR-<div class='error'...>..."
+        if "-ERROR-" in ajax_response:
+            # Fehlermeldung extrahieren
+            error_match = re.search(r'<div[^>]*class=["\']error["\'][^>]*[^>]*>([^<]+(?:<br\s*/?>([^<]+))?)', ajax_response, re.DOTALL)
+            if error_match:
+                error_text = re.sub(r'<[^>]+>', ' ', error_match.group(0)).strip()
+            else:
+                error_text = re.sub(r'<[^>]+>', ' ', ajax_response.replace("-ERROR-", "")).strip()
+            print(f"[COOKIE] ❌ TurkTorrent AJAX-Fehler: {error_text[:200]}")
+            return {"ok": False, "cookie": "", "user_agent": user_agent, "error": f"TurkTorrent: {error_text[:200]}"}
+
+        # Bei Erfolg: Server setzt Login-Cookies via Set-Cookie Headers
+        # Zusätzlich GET an Homepage um Cookies zu bestätigen und TSUE-Status zu prüfen
+        print("[COOKIE] AJAX-Login-Antwort scheint OK! Lade Homepage für Bestätigung...")
+        resp_home = http_session.get(site_url.rstrip("/") + "/", timeout=20, allow_redirects=True)
+        response_html = resp_home.text
+        response_url = str(resp_home.url)
+
+        # Weitere Set-Cookie von Homepage-GET
+        home_cookies = resp_home.raw.headers.getlist("Set-Cookie")
+        if home_cookies:
+            print(f"[COOKIE] Homepage Set-Cookie ({len(home_cookies)}):")
+            for sc in home_cookies[:10]:
+                print(f"[COOKIE]   {sc[:120]}")
+
+        # Alle Cookies aus der HTTP-Session sammeln
+        session_cookies = dict(http_session.cookies)
+        print(f"[COOKIE] Session-Cookies nach Login: {list(session_cookies.keys())}")
+        for k, v in session_cookies.items():
+            print(f"[COOKIE]   {k} = {v[:40]}...")
+
+        # TSUE-Variablen aus HTML extrahieren (Login-Indikator)
+        _member_id_match = re.search(r'memberid:\s*"([^"]+)"', response_html)
+        _member_name_match = re.search(r'membername:\s*"([^"]+)"', response_html)
+        _stkey_match = re.search(r'stKey:\s*"([^"]+)"', response_html)
+        _tsue_memberid = _member_id_match.group(1) if _member_id_match else "?"
+        _tsue_membername = _member_name_match.group(1) if _member_name_match else "?"
+        _tsue_stkey = _stkey_match.group(1) if _stkey_match else "?"
+        print(f"[COOKIE] TSUE memberid={_tsue_memberid}, membername={_tsue_membername}")
+        print(f"[COOKIE] TSUE stKey={_tsue_stkey[:50]}...")
+
+        # Alle Cookies zusammenführen (FlareSolverr cf_clearance + Session-Cookies)
+        all_cookies = {}
+        all_cookies.update(fs_cookies)          # cf_clearance etc.
+        all_cookies.update(session_cookies)     # Login-Cookies aus HTTP-Session (uid, pass, etc.)
+
+        print(f"[COOKIE] Alle Cookies: {list(all_cookies.keys())}")
 
         # Prüfen ob Login erfolgreich war
-        has_login_cookie = any(k in ("uid", "pass", "c_secure_uid", "c_secure_pass") for k in all_cookies)
-        login_failed_in_html = "loginbox" in login_resp.text and "loginbox_password" in login_resp.text
+        has_login_cookie = any(k in ("uid", "pass", "c_secure_uid", "c_secure_pass", "tsue_member") for k in all_cookies)
 
-        if login_failed_in_html and not has_login_cookie:
-            return {"ok": False, "cookie": "", "user_agent": "", "error": "Login fehlgeschlagen – prüfe Username/Passwort"}
+        # TSUE-basierte Login-Erkennung (stärkster Indikator):
+        # Nach dem Login zeigt TurkTorrent memberid != "0" und membername != "Guest"
+        tsue_logged_in = (_tsue_memberid not in ("0", "?") and _tsue_membername not in ("Guest", "?"))
+
+        is_logged_in = False
+        if has_login_cookie:
+            is_logged_in = True
+            print("[COOKIE] ✅ Login erkannt via Login-Cookies")
+        elif tsue_logged_in:
+            is_logged_in = True
+            print(f"[COOKIE] ✅ Login erkannt via TSUE memberid={_tsue_memberid}, membername={_tsue_membername}")
+        elif "member.php?action=logout" in response_html.lower() or "çıkış" in response_html.lower():
+            is_logged_in = True
+            print("[COOKIE] ✅ Login erkannt via Logout-Link auf der Seite")
+        elif username.lower() in response_html.lower():
+            is_logged_in = True
+            print(f"[COOKIE] ✅ Login erkannt via Username '{username}' auf der Seite")
+
+        # Zusätzliche Fehlererkennung (Türkisch: "Hatalı" = "Falsch/Fehler")
+        if "Hatalı" in response_html or "hatal" in response_html.lower():
+            error_match = re.search(r'class=["\']error["\'][^>]*>([^<]+)', response_html)
+            error_msg = error_match.group(1).strip() if error_match else "Unbekannter Fehler von TurkTorrent"
+            print(f"[COOKIE] ❌ TurkTorrent Fehlermeldung: {error_msg}")
+            return {"ok": False, "cookie": "", "user_agent": "", "error": f"TurkTorrent: {error_msg}"}
+
+        if not is_logged_in:
+            snippet = response_html[:500].replace('\n', ' ').replace('\r', '')
+            print(f"[COOKIE] ❌ Login fehlgeschlagen. Keine Login-Cookies und keine Logout-Links gefunden.")
+            print(f"[COOKIE] HTML-Snippet: {snippet[:300]}")
+            return {"ok": False, "cookie": "", "user_agent": "", "error": "Login fehlgeschlagen – keine Login-Bestätigung auf der Seite"}
+
+        if not has_login_cookie:
+            print(f"[COOKIE] ⚠️ Warnung: Keine typischen Login-Cookies, aber Login auf Seite erkannt")
+            print(f"[COOKIE] Vorhandene Cookies: {list(all_cookies.keys())}")
 
         cookie_str = "; ".join(f"{k}={v}" for k, v in all_cookies.items())
-        print(f"[COOKIE] Login erfolgreich! {len(all_cookies)} Cookies erhalten.")
+        print(f"[COOKIE] ✅ Login erfolgreich! {len(all_cookies)} Cookies erhalten: {list(all_cookies.keys())}")
         return {"ok": True, "cookie": cookie_str, "user_agent": user_agent, "error": ""}
 
     except requests.exceptions.ConnectionError:
+        try:
+            _cleanup_flaresolverr_session(fs_api, session_id)
+        except Exception:
+            pass
         return {"ok": False, "cookie": "", "user_agent": "", "error": f"FlareSolverr nicht erreichbar unter {flaresolverr_url}"}
     except requests.exceptions.Timeout:
+        try:
+            _cleanup_flaresolverr_session(fs_api, session_id)
+        except Exception:
+            pass
         return {"ok": False, "cookie": "", "user_agent": "", "error": "Timeout beim Login"}
     except Exception as e:
+        try:
+            _cleanup_flaresolverr_session(fs_api, session_id)
+        except Exception:
+            pass
         return {"ok": False, "cookie": "", "user_agent": "", "error": str(e)[:200]}
 
 
@@ -361,6 +512,23 @@ def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: s
         return {"ok": False, "error": str(e)[:100]}
 
 
+def _get_jackett_session(jackett_url: str, admin_password: str) -> requests.Session:
+    """
+    Erstellt eine authentifizierte Jackett-Session (Admin-Login).
+    Jackett erfordert für Config-API-Zugriffe ein Admin-Cookie.
+    """
+    session = requests.Session()
+    if admin_password:
+        login_url = f"{jackett_url.rstrip('/')}/UI/Dashboard"
+        resp = session.post(login_url, data={"password": admin_password}, timeout=10, allow_redirects=False)
+        # Jackett gibt 302 + Set-Cookie bei erfolgreichem Login
+        if "Jackett" in session.cookies.get_dict():
+            print(f"[JACKETT] Admin-Login erfolgreich")
+        else:
+            print(f"[JACKETT] Admin-Login fehlgeschlagen (HTTP {resp.status_code})")
+    return session
+
+
 def _update_jackett_indexer_cookie(cookie: str, user_agent: str) -> dict:
     """
     Aktualisiert die Cookie-Konfiguration eines Jackett-Indexers über die Jackett API.
@@ -369,35 +537,65 @@ def _update_jackett_indexer_cookie(cookie: str, user_agent: str) -> dict:
     try:
         jackett_url = _config.get("jackett_url", "")
         jackett_api_key = _config.get("jackett_api_key", "")
+        jackett_admin_password = _config.get("jackett_admin_password", "")
         indexer_id = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
 
         if not jackett_url or not jackett_api_key:
             return {"ok": False, "error": "Jackett URL oder API Key nicht konfiguriert"}
+
+        # Admin-Session aufbauen (Jackett erfordert Admin-Cookie für Config-Endpoints)
+        session = _get_jackett_session(jackett_url, jackett_admin_password)
 
         # Aktuelle Indexer-Config von Jackett holen
         config_url = f"{jackett_url.rstrip('/')}/api/v2.0/indexers/{indexer_id}/config"
         headers = {"Content-Type": "application/json"}
         params = {"apikey": jackett_api_key}
 
-        resp = requests.get(config_url, params=params, timeout=10)
+        resp = session.get(config_url, params=params, timeout=10)
+        if resp.status_code == 302:
+            return {"ok": False, "error": "Jackett Admin-Login fehlgeschlagen – falsches Passwort? (jackett_admin_password prüfen)"}
         if not resp.ok:
             return {"ok": False, "error": f"Jackett Config GET HTTP {resp.status_code}: {resp.text[:100]}"}
 
-        config_items = resp.json()
+        try:
+            config_items = resp.json()
+        except Exception:
+            return {"ok": False, "error": f"Jackett Config ungültiges JSON: {resp.text[:100]}"}
 
         # Cookie und User-Agent in der Config aktualisieren
+        updated_fields = []
         for item in config_items:
             item_id = item.get("id", "").lower()
             if item_id == "cookie":
                 item["value"] = cookie
-            elif item_id == "useragent" or item_id == "user-agent" or item_id == "user_agent":
+                updated_fields.append("cookie")
+            elif item_id in ("useragent", "user-agent", "user_agent"):
                 item["value"] = user_agent
+                updated_fields.append("user-agent")
+
+        print(f"[JACKETT] Aktualisiere Felder: {updated_fields}")
 
         # Aktualisierte Config an Jackett senden
-        resp2 = requests.post(config_url, json=config_items, params=params, headers=headers, timeout=10)
+        resp2 = session.post(config_url, json=config_items, params=params, headers=headers, timeout=30)
         if resp2.status_code in (200, 204):
             return {"ok": True, "error": ""}
-        return {"ok": False, "error": f"Jackett Config POST HTTP {resp2.status_code}: {resp2.text[:100]}"}
+
+        # HTTP 500 = Jackett testet den Cookie und der Test schlägt fehl
+        error_detail = ""
+        try:
+            err_json = resp2.json()
+            # Jackett gibt den Fehler im "config" Array unter "lasterror" zurück
+            for item in err_json.get("config", []):
+                if item.get("id") == "lasterror":
+                    error_detail = item.get("value", "")
+                    break
+        except Exception:
+            error_detail = resp2.text[:200]
+
+        if error_detail:
+            print(f"[JACKETT] Fehler-Detail: {error_detail}")
+
+        return {"ok": False, "error": f"Jackett Config POST HTTP {resp2.status_code}: {error_detail or resp2.text[:100]}"}
     except Exception as e:
         return {"ok": False, "error": str(e)[:200]}
 
@@ -426,7 +624,6 @@ def _do_cookie_refresh():
     password = _config.get("turktorrent_password", "")
     site_url = _config.get("turktorrent_site_url", "https://turktorrent.us")
     flaresolverr_url = _config.get("flaresolverr_url", "")
-    twocaptcha_key = _config.get("twocaptcha_api_key", "")
 
     if not username or not password:
         _config["turktorrent_cookie_status"] = "❌ Username/Passwort nicht konfiguriert"
@@ -438,15 +635,22 @@ def _do_cookie_refresh():
         _save_config(_config)
         return {"ok": False, "error": "FlareSolverr URL nicht konfiguriert"}
 
-    if not twocaptcha_key:
-        _config["turktorrent_cookie_status"] = "❌ 2captcha API Key nicht konfiguriert"
-        _save_config(_config)
-        return {"ok": False, "error": "2captcha API Key nicht konfiguriert"}
+    # Zuerst prüfen ob Cookie noch gültig ist
+    current_cookie = _config.get("turktorrent_current_cookie", "")
+    if current_cookie:
+        validation = _validate_turktorrent_cookie(current_cookie, site_url, flaresolverr_url)
+        if validation["ok"]:
+            print(f"[COOKIE] Cookie noch gültig – kein Refresh nötig")
+            _config["turktorrent_cookie_status"] = f"✅ Cookie gültig (geprüft {datetime.now().strftime('%d.%m.%Y %H:%M')})"
+            _config["turktorrent_last_cookie_refresh"] = datetime.now().isoformat()
+            _save_config(_config)
+            return {"ok": True, "error": ""}
+        print(f"[COOKIE] Cookie abgelaufen: {validation['error']}")
 
-    print(f"[COOKIE] Starte TurkTorrent Cookie-Refresh via FlareSolverr + 2captcha für User '{username}'...")
+    print(f"[COOKIE] Starte TurkTorrent Cookie-Refresh via FlareSolverr + manuelles hCaptcha für User '{username}'...")
 
-    # Schritt 1: Login via FlareSolverr + 2captcha
-    login_result = _turktorrent_login(username, password, site_url, flaresolverr_url, twocaptcha_key)
+    # Login via FlareSolverr + manuelles hCaptcha
+    login_result = _turktorrent_login(username, password, site_url, flaresolverr_url)
     if not login_result["ok"]:
         msg = f"❌ Login fehlgeschlagen: {login_result['error']}"
         _config["turktorrent_cookie_status"] = msg
@@ -469,35 +673,72 @@ def _do_cookie_refresh():
         _send_telegram_alert(f"⚠️ <b>Jackett-Update fehlgeschlagen</b>\nLogin war OK, aber Cookie konnte nicht in Jackett eingetragen werden.\n{update_result['error']}")
         return {"ok": False, "error": update_result["error"]}
 
+    # Cookie für spätere Validierung speichern
+    _config["turktorrent_current_cookie"] = login_result["cookie"]
     msg = f"✅ Cookie erfolgreich aktualisiert ({datetime.now().strftime('%d.%m.%Y %H:%M')})"
     _config["turktorrent_cookie_status"] = msg
     _config["turktorrent_last_cookie_refresh"] = datetime.now().isoformat()
     _save_config(_config)
     print(f"[COOKIE] {msg}")
+    _send_telegram_alert(f"✅ <b>Cookie erfolgreich aktualisiert!</b>\nJackett wurde mit neuen TurkTorrent-Cookies versorgt.")
     return {"ok": True, "error": ""}
 
 
 def _cookie_refresh_loop():
-    """Hintergrund-Thread für periodischen Cookie-Refresh."""
+    """Hintergrund-Thread: Prüft alle 5 Min ob Cookie gültig, bei Ablauf sofort Login."""
     # Beim ersten Start kurz warten bis alles initialisiert ist
     time.sleep(30)
+
+    CHECK_INTERVAL = 300  # alle 5 Minuten prüfen
+    _last_captcha_request = 0  # Cooldown: nicht ständig Telegram spammen
+
     while True:
         try:
-            interval = int(_config.get("turktorrent_cookie_interval_minutes", 120))
             enabled = _config.get("turktorrent_cookie_auto_refresh", True)
             username = _config.get("turktorrent_username", "")
             password = _config.get("turktorrent_password", "")
             flaresolverr_url = _config.get("flaresolverr_url", "")
-            twocaptcha_key = _config.get("twocaptcha_api_key", "")
+            site_url = _config.get("turktorrent_site_url", "https://turktorrent.us")
+            current_cookie = _config.get("turktorrent_current_cookie", "")
 
-            if enabled and username and password and flaresolverr_url and twocaptcha_key:
-                with _cookie_refresh_lock:
-                    _do_cookie_refresh()
+            if not (enabled and username and password and flaresolverr_url):
+                time.sleep(CHECK_INTERVAL)
+                continue
 
-            time.sleep(max(interval, 10) * 60)
+            # Cookie validieren
+            if current_cookie:
+                validation = _validate_turktorrent_cookie(current_cookie, site_url, flaresolverr_url)
+                if validation["ok"]:
+                    # Cookie noch gültig → nichts tun
+                    print(f"[COOKIE] ✅ Cookie gültig (Check {datetime.now().strftime('%H:%M')})")
+                    _config["turktorrent_cookie_status"] = f"✅ Cookie gültig (geprüft {datetime.now().strftime('%d.%m.%Y %H:%M')})"
+                    _save_config(_config)
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+
+                # Cookie abgelaufen!
+                print(f"[COOKIE] ⚠️ Cookie abgelaufen: {validation['error']}")
+                _config["turktorrent_cookie_status"] = f"⚠️ Cookie abgelaufen: {validation['error']}"
+                _save_config(_config)
+
+            # Cooldown: nur alle 15 Min ein neues Captcha anfordern (nicht spammen)
+            now = time.time()
+            if now - _last_captcha_request < 900:  # 15 Min Cooldown
+                remaining = int((900 - (now - _last_captcha_request)) / 60)
+                print(f"[COOKIE] Captcha-Cooldown aktiv, nächster Versuch in ~{remaining} Min")
+                time.sleep(CHECK_INTERVAL)
+                continue
+
+            _last_captcha_request = now
+
+            # Login-Versuch starten (wird Telegram-Captcha anfordern)
+            with _cookie_refresh_lock:
+                _do_cookie_refresh()
+
+            time.sleep(CHECK_INTERVAL)
         except Exception as e:
             print(f"[COOKIE] Fehler im Refresh-Loop: {e}")
-            time.sleep(300)  # 5 Min warten bei Fehler
+            time.sleep(CHECK_INTERVAL)
 
 
 def _start_cookie_refresh_thread():
@@ -1312,6 +1553,9 @@ class ResultCache:
 app = Flask(__name__)
 title_cache = TitleCache(ttl_seconds=CACHE_TTL_SECONDS)
 result_cache = ResultCache(ttl_seconds=CACHE_TTL_SECONDS)
+
+# Cookie-Refresh Thread direkt starten (auch unter gunicorn)
+_start_cookie_refresh_thread()
 
 
 @app.before_request
@@ -2173,12 +2417,11 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 <!-- INDEXER -->
 <div class="panel" id="panel-indexer">
 <div class="card"><h2>🔎 Indexer – TurkTorrent.us</h2>
-<div class="hint" style="margin-bottom:12px">Der Login läuft vollautomatisch: <b>FlareSolverr</b> löst Cloudflare, <b>2captcha</b> löst hCaptcha. Du brauchst einen <a href="https://2captcha.com" target="_blank" style="color:var(--accent)">2captcha</a>-Account (~$3 für 1000 Logins, bei 2h-Intervall ~$0.03/Monat).</div>
+<div class="hint" style="margin-bottom:12px">Der Login läuft halb-automatisch: <b>FlareSolverr</b> löst Cloudflare automatisch. Wenn ein <b>hCaptcha</b> erscheint, bekommst du einen <b>Telegram-Link</b> zum manuellen Lösen (dauert ~10 Sek).</div>
 
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
 <div>
 <div class="field"><label>🤖 FlareSolverr URL</label><input id="cfg_flaresolverr_url" placeholder="http://192.168.178.76:30198"></div>
-<div class="field"><label>🔓 2captcha API Key</label><input id="cfg_twocaptcha_api_key" placeholder="2captcha API Key von 2captcha.com"></div>
 <div class="field"><label>👤 TurkTorrent Benutzername</label><input id="cfg_turktorrent_username" placeholder="dein TurkTorrent Username"></div>
 <div class="field"><label>🔑 TurkTorrent Passwort</label><input id="cfg_turktorrent_password" type="password" placeholder="dein TurkTorrent Passwort"></div>
 </div>
@@ -2504,11 +2747,11 @@ async function refreshCookieNow() {
 
 async function testTurkTorrentLogin() {
   try {
-    toast('🧪 Login starten... (dauert ~30-60s für Captcha-Lösung)', 'ok');
+    toast('🧪 Login starten... (Telegram-Captcha wird angefordert)', 'ok');
     const cfg = gatherConfig();
     const r = await api('/gui/api/test-turktorrent-login', {
       method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username: cfg.turktorrent_username, password: cfg.turktorrent_password, site_url: cfg.turktorrent_site_url, flaresolverr_url: cfg.flaresolverr_url, twocaptcha_api_key: cfg.twocaptcha_api_key})
+      body: JSON.stringify({username: cfg.turktorrent_username, password: cfg.turktorrent_password, site_url: cfg.turktorrent_site_url, flaresolverr_url: cfg.flaresolverr_url})
     });
     if (r.ok) {
       toast('✅ Login erfolgreich! Cookie: ' + (r.cookie || '').substring(0, 50) + '...', 'ok');
@@ -3759,7 +4002,7 @@ def gui_save_config():
     global BOXSET_AUTO_DOWNLOAD, BOXSET_PREFER_SEEDERS
     global TURKTORRENT_USERNAME, TURKTORRENT_PASSWORD, TURKTORRENT_COOKIE_AUTO_REFRESH
     global TURKTORRENT_COOKIE_INTERVAL, TURKTORRENT_SITE_URL, TURKTORRENT_JACKETT_INDEXER_ID
-    global FLARESOLVERR_URL, TWOCAPTCHA_API_KEY
+    global FLARESOLVERR_URL
     data = request.json or {}
     for k in _DEFAULT_CONFIG:
         if k in data and data[k] is not None:
@@ -3799,7 +4042,6 @@ def gui_save_config():
     TURKTORRENT_SITE_URL = _config.get("turktorrent_site_url", "https://turktorrent.us")
     TURKTORRENT_JACKETT_INDEXER_ID = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
     FLARESOLVERR_URL = _config.get("flaresolverr_url", "http://192.168.178.76:30198")
-    TWOCAPTCHA_API_KEY = _config.get("twocaptcha_api_key", "")
     title_cache.ttl = CACHE_TTL_SECONDS
     title_cache._last_refresh = None  # Force refresh
     logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
@@ -3861,22 +4103,19 @@ def gui_refresh_cookie():
 
 @app.route("/gui/api/test-turktorrent-login", methods=["POST"])
 def gui_test_turktorrent_login():
-    """Testet den TurkTorrent Login via FlareSolverr ohne die Cookie in Jackett zu aktualisieren."""
+    """Testet den TurkTorrent Login via FlareSolverr (Captcha per Telegram)."""
     data = request.json or {}
     username = data.get("username", _config.get("turktorrent_username", ""))
     password = data.get("password", _config.get("turktorrent_password", ""))
     site_url = data.get("site_url", _config.get("turktorrent_site_url", "https://turktorrent.us"))
     flaresolverr_url = data.get("flaresolverr_url", _config.get("flaresolverr_url", ""))
-    twocaptcha_key = data.get("twocaptcha_api_key", _config.get("twocaptcha_api_key", ""))
 
     if not username or not password:
         return jsonify({"ok": False, "error": "Username und Passwort erforderlich"})
     if not flaresolverr_url:
         return jsonify({"ok": False, "error": "FlareSolverr URL erforderlich"})
-    if not twocaptcha_key:
-        return jsonify({"ok": False, "error": "2captcha API Key erforderlich"})
 
-    result = _turktorrent_login(username, password, site_url, flaresolverr_url, twocaptcha_key)
+    result = _turktorrent_login(username, password, site_url, flaresolverr_url)
     return jsonify(result)
 
 
@@ -4033,6 +4272,100 @@ def gui_refresh_cache():
 @app.route("/gui/api/logs")
 def gui_logs():
     return jsonify({"logs": "\n".join(_log_buffer[-200:])})
+
+
+# ============================================================
+# hCaptcha – Manuelle Lösung per Telegram-Link
+# ============================================================
+
+@app.route("/captcha")
+def captcha_page():
+    """Minimale Handy-freundliche Seite mit NUR dem hCaptcha-Widget."""
+    sitekey = "18b46fe7-6021-408e-b14c-f318dbae672a"
+    bridge_url = request.host_url.rstrip("/")
+    active = _captcha_request_active
+    return render_template_string("""<!DOCTYPE html>
+<html lang="de"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>🔐 TurkTorrent Captcha</title>
+<script src="https://js.hcaptcha.com/1/api.js" async defer></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1923;color:#e8eaed;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:20px}
+.card{background:#1a2332;border-radius:16px;padding:28px;max-width:400px;width:100%;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+h1{font-size:1.3rem;margin-bottom:6px}
+.sub{color:#8899aa;font-size:.85rem;margin-bottom:20px}
+.h-captcha{display:inline-block;margin:16px 0}
+#status{margin-top:16px;padding:12px;border-radius:10px;font-size:.9rem;display:none}
+.ok{background:#1a3a2a;color:#4ade80;display:block!important}
+.err{background:#3a1a1a;color:#f87171;display:block!important}
+.waiting{background:#2a2a1a;color:#fbbf24;display:block!important}
+.inactive{background:#1a2332;color:#8899aa;display:block!important;border:1px dashed #334}
+</style></head><body>
+<div class="card">
+<h1>🔐 TurkTorrent hCaptcha</h1>
+<p class="sub">Captcha lösen → Token wird automatisch an die Bridge gesendet</p>
+{% if not active %}
+<div id="status" class="inactive">⏸️ Kein Captcha angefordert.<br>Die Bridge wartet gerade nicht auf eine Lösung.</div>
+{% else %}
+<div class="h-captcha" data-sitekey="{{ sitekey }}" data-callback="onCaptchaSolved" data-theme="dark"></div>
+<div id="status"></div>
+{% endif %}
+</div>
+<script>
+function onCaptchaSolved(token) {
+  const st = document.getElementById('status');
+  st.className = 'waiting';
+  st.textContent = '⏳ Token wird gesendet...';
+  fetch('{{ bridge_url }}/captcha-callback', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({token: token})
+  })
+  .then(r => r.json())
+  .then(d => {
+    if (d.ok) {
+      st.className = 'ok';
+      st.innerHTML = '✅ Captcha gelöst!<br>Du kannst diese Seite schließen.';
+    } else {
+      st.className = 'err';
+      st.textContent = '❌ ' + (d.error || 'Fehler');
+    }
+  })
+  .catch(e => {
+    st.className = 'err';
+    st.textContent = '❌ Verbindungsfehler: ' + e.message;
+  });
+}
+</script></body></html>""", sitekey=sitekey, bridge_url=bridge_url, active=active)
+
+
+@app.route("/captcha-callback", methods=["POST"])
+def captcha_callback():
+    """Empfängt den hCaptcha-Token vom User (nach manueller Lösung)."""
+    global _pending_captcha_token
+    data = request.json or {}
+    token = data.get("token", "").strip()
+
+    if not token:
+        return jsonify({"ok": False, "error": "Kein Token erhalten"})
+
+    if not _captcha_request_active:
+        return jsonify({"ok": False, "error": "Kein Captcha angefordert – die Bridge wartet gerade nicht"})
+
+    _pending_captcha_token = token
+    _pending_captcha_event.set()
+    print(f"[CAPTCHA] ✅ Manueller Token empfangen: {token[:30]}...")
+    return jsonify({"ok": True, "message": "Token empfangen – Login wird durchgeführt"})
+
+
+@app.route("/captcha-status")
+def captcha_status():
+    """Gibt den aktuellen Captcha-Status zurück."""
+    return jsonify({
+        "active": _captcha_request_active,
+        "waiting": _captcha_request_active and not _pending_captcha_event.is_set(),
+    })
 
 
 # ============================================================

@@ -30,7 +30,7 @@ EXPOSE 9696
 # Gunicorn für Production
 CMD ["gunicorn", \
      "--bind", "0.0.0.0:9696", \
-     "--workers", "2", \
+     "--workers", "1", \
      "--threads", "4", \
      "--timeout", "120", \
      "--access-logfile", "-", \
