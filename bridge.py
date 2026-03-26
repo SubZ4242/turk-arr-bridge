@@ -509,158 +509,78 @@ def _check_tsue_logged_in(html: str) -> bool:
 
 def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: str = "") -> dict:
     """
-    Prüft ob eine TurkTorrent-Cookie noch gültig ist.
-    Strategie:
-      1. Versuche direkt (ohne FlareSolverr) – schnell, klappt wenn cf_clearance noch gültig
-      2. Falls Cloudflare blockt (403/503) → FlareSolverr holt frischen cf_clearance,
-         dann nochmal mit tsue_member + frischem cf_clearance prüfen.
-         So wird nur bei echtem tsue_member-Ablauf ein neues Captcha nötig.
+    Prüft ob der TurkTorrent-Indexer in Jackett funktioniert.
+    Strategie: Einen echten Jackett-Test machen (Suche + Download).
+    Wenn Jackett Torrents liefern kann, ist der Cookie gültig – egal was
+    unsere eigene Homepage-Prüfung sagt (Jackett hat eigenen FlareSolverr).
     Gibt {"ok": bool, "error": str, "fresh_cf_clearance": str} zurück.
     """
     if not cookie:
         return {"ok": False, "error": "Keine Cookie vorhanden", "fresh_cf_clearance": ""}
-    if not flaresolverr_url:
-        flaresolverr_url = _config.get("flaresolverr_url", "")
 
-    # Validierungs-URL: Homepage statt usercp.php (TSUE hat kein usercp.php!)
-    # Die Homepage enthält TSUESettings mit memberid/membername → eingeloggt oder nicht
-    test_url = f"{site_url.rstrip('/')}/"
-    default_ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-
-    # ── Versuch 1: Direkt mit vorhandenen Cookies (schnell) ──
-    cloudflare_block = False
+    # ── Primäre Prüfung: Jackett fragen ob der Indexer funktioniert ──
     try:
-        headers = {
-            "Cookie": cookie,
-            "User-Agent": default_ua
-        }
-        # allow_redirects=True, weil TSUE die Homepage auf ?p=home&pid=1 weiterleitet
-        resp = requests.get(test_url, headers=headers, timeout=15, allow_redirects=True)
-        resp_text = resp.text[:3000]
-        final_url = str(resp.url)
+        jackett_url = _config.get("jackett_url", "")
+        jackett_api_key = _config.get("jackett_api_key", "")
+        jackett_admin_password = _config.get("jackett_admin_password", "")
+        indexer_id = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
 
-        # Cloudflare-Erkennung: Challenge-Seite, cf-Elemente, Turnstile, etc.
-        is_cloudflare = (
-            resp.status_code in (403, 503)
-            or "challenge" in resp_text.lower()
-            or "cf-" in resp_text[:500].lower()
-            or "cloudflare" in resp_text.lower()
-            or "Just a moment" in resp_text
-            or "_cf_chl" in resp_text
-        )
+        if jackett_url and jackett_api_key:
+            # Jackett-Suche: Hole ein Ergebnis und prüfe ob Download klappt
+            session = _get_jackett_session(jackett_url, jackett_admin_password)
+            search_url = f"{jackett_url.rstrip('/')}/api/v2.0/indexers/{indexer_id}/results"
+            resp = session.get(search_url, params={
+                "apikey": jackett_api_key,
+                "Query": "test",
+                "Type": "search",
+            }, timeout=30)
 
-        if is_cloudflare:
-            print(f"[COOKIE] Direkter Zugriff → Cloudflare-Block (HTTP {resp.status_code})")
-            cloudflare_block = True
-        elif resp.ok:
-            # Homepage geladen – prüfe ob eingeloggt via TSUE-Variablen
-            logged_in = _check_tsue_logged_in(resp_text)
-            if logged_in:
-                return {"ok": True, "error": "", "fresh_cf_clearance": ""}
+            if resp.ok:
+                data = resp.json()
+                results = data.get("Results", [])
+
+                if len(results) > 0:
+                    # Versuche einen Torrent herunterzuladen
+                    dl_url = results[0].get("Link", "")
+                    if dl_url:
+                        dl_resp = session.get(dl_url, timeout=15, allow_redirects=True)
+                        ct = dl_resp.headers.get("Content-Type", "").lower()
+                        if "torrent" in ct or "octet" in ct:
+                            print(f"[COOKIE] ✅ Jackett-Test OK: {len(results)} Ergebnisse, Download funktioniert ({len(dl_resp.content)} bytes)")
+                            return {"ok": True, "error": "", "fresh_cf_clearance": ""}
+                        else:
+                            print(f"[COOKIE] ⚠️ Jackett-Download fehlgeschlagen: Content-Type={ct}")
+                            return {"ok": False, "error": f"Jackett-Download fehlgeschlagen (Content-Type: {ct})", "fresh_cf_clearance": ""}
+                    else:
+                        # Ergebnisse vorhanden aber kein Download-Link → trotzdem OK
+                        print(f"[COOKIE] ✅ Jackett-Test OK: {len(results)} Ergebnisse (kein DL-Link zum Testen)")
+                        return {"ok": True, "error": "", "fresh_cf_clearance": ""}
+                else:
+                    # Keine Ergebnisse – könnte an der Suche liegen, nicht am Cookie
+                    # Prüfe ob Jackett einen lasterror hat
+                    config_url = f"{jackett_url.rstrip('/')}/api/v2.0/indexers/{indexer_id}/config"
+                    cfg_resp = session.get(config_url, params={"apikey": jackett_api_key}, timeout=10)
+                    if cfg_resp.ok:
+                        for item in cfg_resp.json():
+                            if item.get("id") == "lasterror" and item.get("value"):
+                                err = item["value"]
+                                print(f"[COOKIE] ❌ Jackett lasterror: {err[:100]}")
+                                return {"ok": False, "error": f"Jackett-Fehler: {err[:100]}", "fresh_cf_clearance": ""}
+                    # Keine Fehler, nur keine Ergebnisse → Cookie vermutlich OK
+                    print(f"[COOKIE] ✅ Jackett erreichbar, keine Fehler (0 Ergebnisse für 'test')")
+                    return {"ok": True, "error": "", "fresh_cf_clearance": ""}
             else:
-                return {"ok": False, "error": "Cookie abgelaufen – nicht eingeloggt auf Homepage", "fresh_cf_clearance": ""}
-        else:
-            # Unerwarteter Status → als Cloudflare-Block behandeln
-            print(f"[COOKIE] Direkter Zugriff → unerwarteter HTTP {resp.status_code}, versuche FlareSolverr")
-            cloudflare_block = True
-    except requests.exceptions.ConnectionError:
-        print("[COOKIE] Direkter Zugriff → ConnectionError, versuche FlareSolverr")
-        cloudflare_block = True
+                print(f"[COOKIE] ⚠️ Jackett-Suche HTTP {resp.status_code}")
+                # Jackett nicht erreichbar → können nicht prüfen → als OK behandeln
+                return {"ok": True, "error": f"Jackett nicht erreichbar (HTTP {resp.status_code})", "fresh_cf_clearance": ""}
     except Exception as e:
-        print(f"[COOKIE] Direkter Zugriff → Fehler: {e}, versuche FlareSolverr")
-        cloudflare_block = True
+        print(f"[COOKIE] ⚠️ Jackett-Validierung fehlgeschlagen: {e}")
+        # Bei Fehler: nicht als "abgelaufen" melden → kein unnötiges Captcha
+        return {"ok": True, "error": f"Jackett-Prüfung fehlgeschlagen: {str(e)[:80]}", "fresh_cf_clearance": ""}
 
-    # ── Versuch 2: FlareSolverr für frischen cf_clearance, dann mit tsue_member prüfen ──
-    if cloudflare_block and flaresolverr_url:
-        print("[COOKIE] Cloudflare blockiert direkten Zugriff – hole frischen cf_clearance via FlareSolverr...")
-        try:
-            fs_api = f"{flaresolverr_url.rstrip('/')}/v1"
-            session_id = f"validate_{int(time.time())}"
-            requests.post(fs_api, json={"cmd": "sessions.create", "session": session_id}, timeout=10)
-
-            resp_fs = requests.post(fs_api, json={
-                "cmd": "request.get",
-                "url": site_url.rstrip("/") + "/",
-                "session": session_id,
-                "maxTimeout": 60000,
-            }, timeout=90)
-
-            # Session sofort aufräumen
-            _cleanup_flaresolverr_session(fs_api, session_id)
-
-            if resp_fs.ok:
-                data = resp_fs.json()
-                if data.get("status") == "ok":
-                    solution = data.get("solution", {})
-                    fs_cookies = {c["name"]: c["value"] for c in solution.get("cookies", []) if c.get("name") and c.get("value")}
-                    new_cf_clearance = fs_cookies.get("cf_clearance", "")
-                    new_ua = solution.get("userAgent", "")
-
-                    if new_cf_clearance:
-                        print(f"[COOKIE] Frischer cf_clearance erhalten: {new_cf_clearance[:30]}...")
-
-                        # Cookie-String aktualisieren: alten cf_clearance ersetzen
-                        cookie_parts = {}
-                        for part in cookie.split(";"):
-                            part = part.strip()
-                            if "=" in part:
-                                k, v = part.split("=", 1)
-                                cookie_parts[k.strip()] = v.strip()
-                        cookie_parts["cf_clearance"] = new_cf_clearance
-                        updated_cookie = "; ".join(f"{k}={v}" for k, v in cookie_parts.items())
-                        use_ua = new_ua or default_ua
-
-                        # Jetzt mit frischem cf_clearance + altem tsue_member nochmal prüfen
-                        headers2 = {
-                            "Cookie": updated_cookie,
-                            "User-Agent": use_ua
-                        }
-                        print(f"[COOKIE] Teste tsue_member mit frischem cf_clearance...")
-                        resp2 = requests.get(test_url, headers=headers2, timeout=15, allow_redirects=True)
-                        resp2_text = resp2.text[:3000]
-                        print(f"[COOKIE] Validierung nach cf_clearance-Refresh: HTTP {resp2.status_code}, URL: {resp2.url}")
-
-                        # Cloudflare-Check (sollte jetzt nicht mehr kommen)
-                        is_cf2 = "challenge" in resp2_text.lower() or "Just a moment" in resp2_text
-                        
-                        if is_cf2:
-                            print(f"[COOKIE] ⚠️ Auch nach cf_clearance-Refresh noch Cloudflare-Block")
-                            return {"ok": False, "error": "Cloudflare-Block trotz frischem cf_clearance", "fresh_cf_clearance": new_cf_clearance}
-
-                        if resp2.ok:
-                            # Homepage geladen – prüfe TSUE-Login-Status
-                            logged_in = _check_tsue_logged_in(resp2.text)
-                            if logged_in:
-                                print("[COOKIE] ✅ tsue_member noch gültig! Nur cf_clearance war abgelaufen.")
-                                _config["turktorrent_current_cookie"] = updated_cookie
-                                if new_ua:
-                                    _config["turktorrent_current_user_agent"] = new_ua
-                                _save_config(_config)
-                                print("[COOKIE] Aktualisiere Jackett mit frischem cf_clearance...")
-                                _update_jackett_indexer_cookie(updated_cookie, use_ua)
-                                return {"ok": True, "error": "", "fresh_cf_clearance": new_cf_clearance}
-                            else:
-                                # TSUE sagt nicht eingeloggt → tsue_member wirklich abgelaufen
-                                _mid = re.search(r'memberid:\s*"([^"]+)"', resp2.text)
-                                _mname = re.search(r'membername:\s*"([^"]+)"', resp2.text)
-                                mid = _mid.group(1) if _mid else "?"
-                                mname = _mname.group(1) if _mname else "?"
-                                print(f"[COOKIE] ❌ tsue_member abgelaufen (memberid={mid}, membername={mname})")
-                                return {"ok": False, "error": f"Cookie abgelaufen – memberid={mid}, membername={mname}", "fresh_cf_clearance": new_cf_clearance}
-
-                        return {"ok": False, "error": f"HTTP {resp2.status_code} nach cf_clearance-Refresh", "fresh_cf_clearance": new_cf_clearance}
-
-            print(f"[COOKIE] FlareSolverr konnte cf_clearance nicht erneuern (FlareSolverr HTTP {resp_fs.status_code if 'resp_fs' in dir() else '?'})")
-        except Exception as e:
-            print(f"[COOKIE] FlareSolverr-Validierung fehlgeschlagen: {e}")
-            import traceback
-            traceback.print_exc()
-
-    # Fallback: kein FlareSolverr oder FlareSolverr auch fehlgeschlagen
-    if not flaresolverr_url:
-        return {"ok": True, "error": "Cloudflare-Block, kein FlareSolverr – Status unklar", "fresh_cf_clearance": ""}
-
-    return {"ok": False, "error": "Cloudflare-Block, cf_clearance konnte nicht erneuert werden", "fresh_cf_clearance": ""}
+    # Fallback wenn Jackett nicht konfiguriert: Cookie als gültig behandeln
+    # (besser kein unnötiges Captcha als ständig nerven)
+    return {"ok": True, "error": "Jackett nicht konfiguriert – Cookie-Status unklar", "fresh_cf_clearance": ""}
 
 
 def _get_jackett_session(jackett_url: str, admin_password: str) -> requests.Session:
