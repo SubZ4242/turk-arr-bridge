@@ -3514,8 +3514,8 @@ _start_time = datetime.now()
 # ── GitHub Update-Checker ──
 import hashlib as _hl
 
-_GITHUB_RAW_URL = "https://raw.githubusercontent.com/SubZ4242/turk-arr-bridge/main/bridge.py"
 _GITHUB_API_URL = "https://api.github.com/repos/SubZ4242/turk-arr-bridge/commits?path=bridge.py&per_page=1"
+_GITHUB_CONTENT_API = "https://api.github.com/repos/SubZ4242/turk-arr-bridge/contents/bridge.py"
 _update_info = {"update_available": False, "remote_sha": "", "remote_date": "", "message": "", "checked": ""}
 _update_lock = threading.Lock()
 
@@ -3528,35 +3528,47 @@ def _get_local_bridge_hash() -> str:
     except Exception:
         return ""
 
+def _get_git_blob_sha(content: bytes) -> str:
+    """Berechnet den Git Blob SHA1 für einen Dateiinhalt (identisch mit git hash-object)."""
+    header = f"blob {len(content)}\0".encode()
+    return _hl.sha1(header + content).hexdigest()
+
 def _check_github_update():
     """Prüft ob auf GitHub eine neuere Version von bridge.py liegt."""
     global _update_info
     try:
-        local_hash = _get_local_bridge_hash()
-        if not local_hash:
+        # Lokale Datei als Git-Blob-SHA berechnen (gleich wie git hash-object)
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.py")
+        with open(p, "rb") as f:
+            local_content = f.read()
+        local_blob_sha = _get_git_blob_sha(local_content)
+
+        # GitHub Contents API: liefert den Git-Blob-SHA direkt (kein CDN-Caching Problem)
+        headers = {"Accept": "application/vnd.github.v3+json"}
+        content_resp = requests.get(_GITHUB_CONTENT_API, timeout=15, headers=headers)
+        if not content_resp.ok:
+            print(f"[UPDATE] GitHub API HTTP {content_resp.status_code}")
+            return
+        content_data = content_resp.json()
+        remote_blob_sha = content_data.get("sha", "")
+
+        if not remote_blob_sha:
             return
 
-        # Remote-Datei holen und Hash vergleichen
-        resp = requests.get(_GITHUB_RAW_URL, timeout=15)
-        if resp.status_code != 200:
-            return
-        remote_hash = _hl.sha256(resp.content).hexdigest()
-
-        if remote_hash == local_hash:
+        if remote_blob_sha == local_blob_sha:
             with _update_lock:
                 _update_info = {
-                    "update_available": False, "remote_sha": remote_hash[:12],
+                    "update_available": False, "remote_sha": remote_blob_sha[:12],
                     "remote_date": "", "message": "Aktuelle Version läuft bereits.",
                     "checked": datetime.now().strftime("%d.%m.%Y %H:%M")
                 }
             return
 
-        # Commit-Datum holen
+        # Commit-Info holen (Datum, Nachricht)
         remote_date = ""
         commit_msg = ""
         try:
-            api_resp = requests.get(_GITHUB_API_URL, timeout=10,
-                                    headers={"Accept": "application/vnd.github.v3+json"})
+            api_resp = requests.get(_GITHUB_API_URL, timeout=10, headers=headers)
             if api_resp.ok:
                 commits = api_resp.json()
                 if commits:
@@ -3567,12 +3579,12 @@ def _check_github_update():
 
         with _update_lock:
             _update_info = {
-                "update_available": True, "remote_sha": remote_hash[:12],
+                "update_available": True, "remote_sha": remote_blob_sha[:12],
                 "remote_date": remote_date,
                 "message": commit_msg or "Neue Version verfügbar auf GitHub!",
                 "checked": datetime.now().strftime("%d.%m.%Y %H:%M")
             }
-        print(f"[UPDATE] ⬆️ Neue Version auf GitHub verfügbar (Remote-Hash: {remote_hash[:12]})")
+        print(f"[UPDATE] ⬆️ Neue Version auf GitHub verfügbar (Blob: {remote_blob_sha[:12]} ≠ {local_blob_sha[:12]})")
     except Exception as e:
         print(f"[UPDATE] Fehler beim GitHub-Check: {e}")
 
