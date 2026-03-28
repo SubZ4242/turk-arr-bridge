@@ -538,6 +538,17 @@ def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: s
             if resp.ok:
                 data = resp.json()
                 results = data.get("Results", [])
+                indexers = data.get("Indexers", [])
+
+                # ── Zuerst: Prüfe ob Jackett einen Indexer-Fehler meldet ──
+                # Jackett gibt Fehler im Indexers[]-Array zurück (z.B. "Login failed")
+                for idx_info in indexers:
+                    idx_error = idx_info.get("Error", "")
+                    if idx_error:
+                        # Login-Fehler → Cookie ist definitiv ungültig
+                        short_err = idx_error.split("\n")[0][:120]  # Erste Zeile, max 120 Zeichen
+                        print(f"[COOKIE] ❌ Jackett Indexer-Fehler: {short_err}")
+                        return {"ok": False, "error": f"Jackett: {short_err}", "fresh_cf_clearance": ""}
 
                 if len(results) > 0:
                     # Versuche einen Torrent herunterzuladen
@@ -556,17 +567,8 @@ def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: s
                         print(f"[COOKIE] ✅ Jackett-Test OK: {len(results)} Ergebnisse (kein DL-Link zum Testen)")
                         return {"ok": True, "error": "", "fresh_cf_clearance": ""}
                 else:
-                    # Keine Ergebnisse – könnte an der Suche liegen, nicht am Cookie
-                    # Prüfe ob Jackett einen lasterror hat
-                    config_url = f"{jackett_url.rstrip('/')}/api/v2.0/indexers/{indexer_id}/config"
-                    cfg_resp = session.get(config_url, params={"apikey": jackett_api_key}, timeout=10)
-                    if cfg_resp.ok:
-                        for item in cfg_resp.json():
-                            if item.get("id") == "lasterror" and item.get("value"):
-                                err = item["value"]
-                                print(f"[COOKIE] ❌ Jackett lasterror: {err[:100]}")
-                                return {"ok": False, "error": f"Jackett-Fehler: {err[:100]}", "fresh_cf_clearance": ""}
-                    # Keine Fehler, nur keine Ergebnisse → Cookie vermutlich OK
+                    # Keine Ergebnisse und kein Fehler → Cookie vermutlich OK
+                    # (Suchbegriff hat einfach nichts gefunden)
                     print(f"[COOKIE] ✅ Jackett erreichbar, keine Fehler (0 Ergebnisse für 'test')")
                     return {"ok": True, "error": "", "fresh_cf_clearance": ""}
             else:
@@ -2340,10 +2342,15 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 @keyframes slideIn{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
 .spinner{display:inline-block;width:16px;height:16px;border:2px solid var(--border);border-top-color:var(--accent2);border-radius:50%;animation:spin .6s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.stats-row{display:flex;gap:16px;flex-wrap:wrap;margin-bottom:16px}
-.stat{background:var(--card2);border:1px solid var(--border);border-radius:10px;padding:16px 20px;flex:1;min-width:140px;text-align:center;box-shadow:0 4px 20px rgba(0,0,0,.55),0 1px 0 rgba(255,255,255,.03) inset}
-.stat .num{font-size:1.8rem;font-weight:700;color:var(--accent2)}
-.stat .lbl{font-size:.75rem;color:var(--text3);margin-top:4px}
+#updateBanner{display:none;position:fixed;bottom:24px;right:24px;z-index:9998;background:linear-gradient(135deg,#1e1b4b,#312e81);border:1px solid #6366f1;border-radius:12px;padding:14px 18px;max-width:340px;box-shadow:0 8px 32px rgba(0,0,0,.6);animation:slideIn .4s}
+#updateBanner .ub-title{font-size:.85rem;font-weight:600;color:#a5b4fc;margin-bottom:4px}
+#updateBanner .ub-msg{font-size:.75rem;color:#c7d2fe;line-height:1.4}
+#updateBanner .ub-actions{display:flex;gap:8px;margin-top:10px;align-items:center}
+#updateBanner .ub-btn{padding:5px 14px;border-radius:6px;font-size:.75rem;font-weight:600;cursor:pointer;border:none}
+#updateBanner .ub-btn.primary{background:#6366f1;color:#fff}
+#updateBanner .ub-btn.primary:hover{background:#818cf8}
+#updateBanner .ub-btn.dismiss{background:transparent;color:#94a3b8;text-decoration:underline}
+#updateBanner .ub-close{position:absolute;top:6px;right:10px;background:none;border:none;color:#94a3b8;font-size:1.1rem;cursor:pointer}
 .hint{font-size:.72rem;color:var(--text3);margin-top:2px;line-height:1.3}
 </style>
 </head>
@@ -2428,13 +2435,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 
 <!-- DASHBOARD -->
 <div class="panel active" id="panel-dashboard">
-<div class="stats-row" id="statsRow">
-<div class="stat"><div class="num" id="statMappings">-</div><div class="lbl" data-i18n="stat_mappings">Titel-Mappings</div></div>
-<div class="stat"><div class="num" id="statLearned" style="color:#a78bfa">-</div><div class="lbl" data-i18n="stat_learned">🧠 Gelernt</div></div>
-<div class="stat"><div class="num" id="statSeries">-</div><div class="lbl" data-i18n="stat_series">Serien (Sonarr)</div></div>
-<div class="stat"><div class="num" id="statMovies">-</div><div class="lbl" data-i18n="stat_movies">Filme (Radarr)</div></div>
-<div class="stat"><div class="num" id="statUptime">-</div><div class="lbl" data-i18n="stat_uptime">Uptime</div></div>
-</div>
+
 <div class="card"><h2>🔗 <span data-i18n="dash_connections">Verbindungen</span></h2>
 <div class="conn-grid" id="connGrid"></div>
 <div class="btn-row" style="justify-content:flex-end"><button class="btn btn-primary" onclick="testAllConnections()">🔄 <span data-i18n="btn_test_all">Alle testen</span></button></div>
@@ -2741,6 +2742,33 @@ async function loadVersion() {
 }
 loadVersion();
 
+// ── Update-Check ──
+let _updateDismissed = sessionStorage.getItem('updateDismissed') || '';
+async function checkForUpdate() {
+  try {
+    const r = await api('/gui/api/update-check');
+    const banner = document.getElementById('updateBanner');
+    if (!banner) return;
+    if (r.update_available && _updateDismissed !== r.remote_sha) {
+      document.getElementById('ubMsg').textContent = r.message || 'Neue Version verfügbar!';
+      document.getElementById('ubDate').textContent = r.remote_date ? ('Aktualisiert: ' + r.remote_date) : '';
+      banner.style.display = 'block';
+    } else {
+      banner.style.display = 'none';
+    }
+  } catch(e) {}
+}
+function dismissUpdate() {
+  const banner = document.getElementById('updateBanner');
+  if (banner) banner.style.display = 'none';
+  // Für diese Session merken
+  api('/gui/api/update-check').then(r => {
+    if (r.remote_sha) { _updateDismissed = r.remote_sha; sessionStorage.setItem('updateDismissed', r.remote_sha); }
+  }).catch(()=>{});
+}
+checkForUpdate();
+setInterval(checkForUpdate, 300000); // alle 5 Min
+
 function toggleGroup(el) {
   el.classList.toggle('open');
   const items = el.nextElementSibling;
@@ -2880,14 +2908,6 @@ async function loadDashboardIndexerStatus() {
 // ── Dashboard ──
 async function loadDashboard() {
   try {
-    const [health, mappings] = await Promise.all([
-      api('/gui/api/health'), api('/gui/api/mappings-count')
-    ]);
-    document.getElementById('statMappings').textContent = mappings.count || '-';
-    document.getElementById('statSeries').textContent = health.sonarr_series ?? '-';
-    document.getElementById('statMovies').textContent = health.radarr_movies ?? '-';
-    document.getElementById('statUptime').textContent = health.uptime || '-';
-    document.getElementById('statLearned').textContent = health.learned_count ?? '-';
     testAllConnections();
     loadDashboardIndexerStatus();
   } catch(e) { console.error(e); }
@@ -3459,6 +3479,16 @@ setLang(_lang);
 <div class="sub-header">
 <div class="sub-header-status"><div class="sub-header-dot"></div><span data-i18n="sub_online">Online</span></div>
 <div class="sub-header-version" id="subVersion">v1.0.0</div>
+<div id="updateBanner">
+<button class="ub-close" onclick="dismissUpdate()">&times;</button>
+<div class="ub-title">🔄 Update verfügbar</div>
+<div class="ub-msg" id="ubMsg">Neue Version auf GitHub verfügbar!</div>
+<div class="ub-msg" id="ubDate" style="font-size:.68rem;color:#94a3b8;margin-top:2px"></div>
+<div class="ub-actions">
+<a class="ub-btn primary" href="https://github.com/SubZ4242/turk-arr-bridge" target="_blank">GitHub öffnen</a>
+<button class="ub-btn dismiss" onclick="dismissUpdate()">Später</button>
+</div>
+</div>
 </div>
 </body>
 </html>"""
@@ -3481,6 +3511,85 @@ logging.getLogger().addHandler(_gui_handler)
 
 _start_time = datetime.now()
 
+# ── GitHub Update-Checker ──
+import hashlib as _hl
+
+_GITHUB_RAW_URL = "https://raw.githubusercontent.com/SubZ4242/turk-arr-bridge/main/bridge.py"
+_GITHUB_API_URL = "https://api.github.com/repos/SubZ4242/turk-arr-bridge/commits?path=bridge.py&per_page=1"
+_update_info = {"update_available": False, "remote_sha": "", "remote_date": "", "message": "", "checked": ""}
+_update_lock = threading.Lock()
+
+def _get_local_bridge_hash() -> str:
+    """SHA256 der aktuell laufenden bridge.py."""
+    try:
+        p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bridge.py")
+        with open(p, "rb") as f:
+            return _hl.sha256(f.read()).hexdigest()
+    except Exception:
+        return ""
+
+def _check_github_update():
+    """Prüft ob auf GitHub eine neuere Version von bridge.py liegt."""
+    global _update_info
+    try:
+        local_hash = _get_local_bridge_hash()
+        if not local_hash:
+            return
+
+        # Remote-Datei holen und Hash vergleichen
+        resp = requests.get(_GITHUB_RAW_URL, timeout=15)
+        if resp.status_code != 200:
+            return
+        remote_hash = _hl.sha256(resp.content).hexdigest()
+
+        if remote_hash == local_hash:
+            with _update_lock:
+                _update_info = {
+                    "update_available": False, "remote_sha": remote_hash[:12],
+                    "remote_date": "", "message": "Aktuelle Version läuft bereits.",
+                    "checked": datetime.now().strftime("%d.%m.%Y %H:%M")
+                }
+            return
+
+        # Commit-Datum holen
+        remote_date = ""
+        commit_msg = ""
+        try:
+            api_resp = requests.get(_GITHUB_API_URL, timeout=10,
+                                    headers={"Accept": "application/vnd.github.v3+json"})
+            if api_resp.ok:
+                commits = api_resp.json()
+                if commits:
+                    remote_date = commits[0].get("commit", {}).get("committer", {}).get("date", "")[:10]
+                    commit_msg = commits[0].get("commit", {}).get("message", "").split("\n")[0][:80]
+        except Exception:
+            pass
+
+        with _update_lock:
+            _update_info = {
+                "update_available": True, "remote_sha": remote_hash[:12],
+                "remote_date": remote_date,
+                "message": commit_msg or "Neue Version verfügbar auf GitHub!",
+                "checked": datetime.now().strftime("%d.%m.%Y %H:%M")
+            }
+        print(f"[UPDATE] ⬆️ Neue Version auf GitHub verfügbar (Remote-Hash: {remote_hash[:12]})")
+    except Exception as e:
+        print(f"[UPDATE] Fehler beim GitHub-Check: {e}")
+
+def _update_check_loop():
+    """Hintergrund-Thread: Prüft alle 30 Min ob neue Version auf GitHub."""
+    time.sleep(60)  # Beim Start 1 Min warten
+    while True:
+        _check_github_update()
+        time.sleep(1800)  # Alle 30 Minuten
+
+def _start_update_check_thread():
+    t = threading.Thread(target=_update_check_loop, daemon=True)
+    t.start()
+    print("[UPDATE] GitHub Update-Check Thread gestartet")
+
+# GitHub Update-Check Thread direkt starten (auch unter gunicorn)
+_start_update_check_thread()
 
 import os as _os
 app.secret_key = _os.environ.get("TAB_SECRET_KEY", "turk-arr-bridge-secret-2024")
@@ -3865,6 +3974,12 @@ def gui_health():
         "title_cache": stats,
         "learned_count": len(_learned_db),
     })
+
+
+@app.route("/gui/api/update-check")
+def gui_update_check():
+    with _update_lock:
+        return jsonify(_update_info)
 
 
 @app.route("/gui/api/mappings-count")
@@ -4468,5 +4583,8 @@ if __name__ == "__main__":
 
     # Cookie-Refresh Thread starten
     _start_cookie_refresh_thread()
+
+    # GitHub Update-Check Thread starten
+    _start_update_check_thread()
 
     app.run(host=BRIDGE_HOST, port=BRIDGE_PORT, debug=(LOG_LEVEL == "DEBUG"), threaded=True, use_reloader=False)
