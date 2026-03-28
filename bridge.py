@@ -3479,6 +3479,7 @@ setLang(_lang);
 <div class="sub-header">
 <div class="sub-header-status"><div class="sub-header-dot"></div><span data-i18n="sub_online">Online</span></div>
 <div class="sub-header-version" id="subVersion">v1.0.0</div>
+<a href="https://github.com/SubZ4242/turk-arr-bridge" target="_blank" style="font-size:.72rem;color:var(--text3);text-decoration:none;letter-spacing:.05em;font-family:'JetBrains Mono','Fira Code',monospace" onmouseover="this.style.color='var(--accent2)'" onmouseout="this.style.color='var(--text3)'">GitHub</a>
 <div id="updateBanner">
 <button class="ub-close" onclick="dismissUpdate()">&times;</button>
 <div class="ub-title">🔄 Update verfügbar</div>
