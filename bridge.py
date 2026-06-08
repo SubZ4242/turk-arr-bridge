@@ -163,6 +163,18 @@ _pending_captcha_token: Optional[str] = None
 _pending_captcha_event = threading.Event()
 _captcha_request_active = False  # True wenn auf Captcha gewartet wird
 
+_TURKTORRENT_PERSISTENT_COOKIE_NAMES = {
+    "uid", "pass", "c_secure_uid", "c_secure_pass",
+    "member_id", "memberid", "member_hash", "membername",
+    "bb_userid", "bb_password", "bbuserid", "bbpassword",
+    "login_key", "remember", "rememberme", "tsue_member", "tsue_pass",
+}
+
+_TURKTORRENT_VOLATILE_COOKIE_NAMES = {
+    "cf_clearance", "__cf_bm", "cf_chl_2", "cf_chl_prog",
+    "phpsessid", "session", "sessionid", "ci_session",
+}
+
 
 def _request_manual_captcha(site_url: str, timeout_minutes: int = 10) -> dict:
     """
@@ -454,8 +466,13 @@ def _turktorrent_login(username: str, password: str, site_url: str, flaresolverr
             print(f"[COOKIE] ⚠️ Warnung: Keine typischen Login-Cookies, aber Login auf Seite erkannt")
             print(f"[COOKIE] Vorhandene Cookies: {list(all_cookies.keys())}")
 
-        cookie_str = "; ".join(f"{k}={v}" for k, v in all_cookies.items())
-        print(f"[COOKIE] ✅ Login erfolgreich! {len(all_cookies)} Cookies erhalten: {list(all_cookies.keys())}")
+        persistent_cookies = _filter_persistent_turktorrent_cookies(all_cookies)
+        dropped_cookie_names = [name for name in all_cookies.keys() if name not in persistent_cookies]
+        if dropped_cookie_names:
+            print(f"[COOKIE] Entferne kurzlebige Cookies vor dem Speichern: {dropped_cookie_names}")
+
+        cookie_str = "; ".join(f"{k}={v}" for k, v in persistent_cookies.items())
+        print(f"[COOKIE] ✅ Login erfolgreich! {len(persistent_cookies)} persistente Cookies gespeichert: {list(persistent_cookies.keys())}")
         return {"ok": True, "cookie": cookie_str, "user_agent": user_agent, "error": ""}
 
     except requests.exceptions.ConnectionError:
@@ -505,6 +522,56 @@ def _check_tsue_logged_in(html: str) -> bool:
         return True
 
     return False
+
+
+def _filter_persistent_turktorrent_cookies(cookies: dict) -> dict:
+    """
+    Behalte nur langlebige Login-Cookies.
+
+    Cloudflare- und Session-Cookies laufen häufig deutlich früher ab als die
+    eigentlichen Remember-Me-Login-Cookies. Werden sie mitgespeichert, löst das
+    unnötige Re-Logins aus, obwohl die Anmeldung selbst noch gültig ist.
+    """
+    if not cookies:
+        return {}
+
+    persistent = {}
+    fallback = {}
+
+    for name, value in cookies.items():
+        lowered = name.lower()
+        if lowered in _TURKTORRENT_PERSISTENT_COOKIE_NAMES:
+            persistent[name] = value
+            continue
+
+        if lowered in _TURKTORRENT_VOLATILE_COOKIE_NAMES:
+            continue
+
+        if lowered.startswith("__cf") or "session" in lowered or lowered.endswith("sessid"):
+            continue
+
+        fallback[name] = value
+
+    if persistent:
+        return persistent
+
+    if fallback:
+        return fallback
+
+    return dict(cookies)
+
+
+def _cookie_refresh_due(last_refresh_iso: str, interval_minutes: int) -> bool:
+    """Prüft, ob seit dem letzten erfolgreichen Login das Refresh-Intervall abgelaufen ist."""
+    if interval_minutes <= 0 or not last_refresh_iso:
+        return True
+
+    try:
+        last_refresh = datetime.fromisoformat(last_refresh_iso)
+    except Exception:
+        return True
+
+    return datetime.now() >= last_refresh + timedelta(minutes=interval_minutes)
 
 
 def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: str = "") -> dict:
@@ -720,7 +787,6 @@ def _do_cookie_refresh():
         if validation["ok"]:
             print(f"[COOKIE] Cookie noch gültig – kein Refresh nötig")
             _config["turktorrent_cookie_status"] = f"✅ Cookie gültig (geprüft {datetime.now().strftime('%d.%m.%Y %H:%M')})"
-            _config["turktorrent_last_cookie_refresh"] = datetime.now().isoformat()
             _save_config(_config)
             return {"ok": True, "error": ""}
         print(f"[COOKIE] Cookie abgelaufen: {validation['error']}")
@@ -732,7 +798,6 @@ def _do_cookie_refresh():
     if not login_result["ok"]:
         msg = f"❌ Login fehlgeschlagen: {login_result['error']}"
         _config["turktorrent_cookie_status"] = msg
-        _config["turktorrent_last_cookie_refresh"] = datetime.now().isoformat()
         _save_config(_config)
         print(f"[COOKIE] {msg}")
         _send_telegram_alert(f"❌ <b>Cookie-Refresh fehlgeschlagen</b>\n{login_result['error']}")
@@ -745,7 +810,6 @@ def _do_cookie_refresh():
     if not update_result["ok"]:
         msg = f"⚠️ Login OK, Jackett-Update fehlgeschlagen: {update_result['error']}"
         _config["turktorrent_cookie_status"] = msg
-        _config["turktorrent_last_cookie_refresh"] = datetime.now().isoformat()
         _save_config(_config)
         print(f"[COOKIE] {msg}")
         _send_telegram_alert(f"⚠️ <b>Jackett-Update fehlgeschlagen</b>\nLogin war OK, aber Cookie konnte nicht in Jackett eingetragen werden.\n{update_result['error']}")
@@ -778,6 +842,8 @@ def _cookie_refresh_loop():
             flaresolverr_url = _config.get("flaresolverr_url", "")
             site_url = _config.get("turktorrent_site_url", "https://turktorrent.us")
             current_cookie = _config.get("turktorrent_current_cookie", "")
+            refresh_interval = int(_config.get("turktorrent_cookie_interval_minutes", 120) or 120)
+            last_refresh = _config.get("turktorrent_last_cookie_refresh", "")
 
             if not (enabled and username and password and flaresolverr_url):
                 time.sleep(CHECK_INTERVAL)
@@ -787,6 +853,11 @@ def _cookie_refresh_loop():
             if _captcha_request_active:
                 print(f"[COOKIE] ⏳ Captcha-Request läuft, warte...")
                 time.sleep(60)  # kürzeres Intervall, damit wir schnell reagieren
+                continue
+
+            if current_cookie and not _cookie_refresh_due(last_refresh, refresh_interval):
+                print(f"[COOKIE] ⏳ Cookie noch innerhalb des Refresh-Intervalls ({refresh_interval} Min) – keine Re-Validierung nötig")
+                time.sleep(CHECK_INTERVAL)
                 continue
 
             # Cookie validieren
@@ -3606,6 +3677,7 @@ _start_update_check_thread()
 
 import os as _os
 app.secret_key = _os.environ.get("TAB_SECRET_KEY", "turk-arr-bridge-secret-2024")
+app.permanent_session_lifetime = timedelta(days=30)
 
 LOGIN_HTML = r"""
 <!DOCTYPE html><html lang="de">
@@ -3902,6 +3974,7 @@ def gui_login():
         req_user = request.form.get("username", "").strip()
         req_pw   = request.form.get("password", "").strip()
         if req_user == user and req_pw == pw:
+            session.permanent = True
             session["gui_authenticated"] = True
             return redirect("/gui/")
         return render_template_string(LOGIN_HTML, error="Falscher Benutzername oder Passwort.")
@@ -3929,6 +4002,7 @@ def gui_setup():
         _save_config(cfg)
         global _config
         _config = cfg
+        session.permanent = True
         session["gui_authenticated"] = True
         return redirect("/gui/")
     return render_template_string(SETUP_HTML, error="")
@@ -4502,7 +4576,7 @@ def captcha_page():
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1923;color:#e8eaed;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:20px}
-.card{background:#1a2332;border-radius:16px;padding:28px;max-width:400px;width:100%;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.4)}
+.card{background:#1a2332;border-radius:16px;padding:28px;max-width:400px;width:100%;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.4);position:relative}
 h1{font-size:1.3rem;margin-bottom:6px}
 .sub{color:#8899aa;font-size:.85rem;margin-bottom:20px}
 .h-captcha{display:inline-block;margin:16px 0}
@@ -4511,8 +4585,21 @@ h1{font-size:1.3rem;margin-bottom:6px}
 .err{background:#3a1a1a;color:#f87171;display:block!important}
 .waiting{background:#2a2a1a;color:#fbbf24;display:block!important}
 .inactive{background:#1a2332;color:#8899aa;display:block!important;border:1px dashed #334}
+.refresh-btn{position:absolute;top:16px;right:16px;background:none;border:none;color:#8899aa;cursor:pointer;width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;transition:all .25s ease}
+.refresh-btn:hover{color:#e8eaed;background:rgba(255,255,255,.08)}
+.refresh-btn svg{width:20px;height:20px;transition:transform .4s ease}
+.refresh-btn.spinning svg{animation:spin 1s linear infinite}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+.refresh-btn[disabled]{opacity:.4;cursor:not-allowed}
 </style></head><body>
 <div class="card">
+<button class="refresh-btn" id="refreshBtn" onclick="requestNewCaptcha()" title="Neuen Cookie-Refresh anfordern">
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M21.5 2v6h-6"/><path d="M2.5 22v-6h6"/>
+    <path d="M2.5 11.5a10 10 0 0 1 16.5-5.7L21.5 8"/>
+    <path d="M21.5 12.5a10 10 0 0 1-16.5 5.7L2.5 16"/>
+  </svg>
+</button>
 <h1>🔐 TurkTorrent hCaptcha</h1>
 <p class="sub">Captcha lösen → Token wird automatisch an die Bridge gesendet</p>
 {% if not active %}
@@ -4547,6 +4634,60 @@ function onCaptchaSolved(token) {
     st.textContent = '❌ Verbindungsfehler: ' + e.message;
   });
 }
+
+function requestNewCaptcha() {
+  const btn = document.getElementById('refreshBtn');
+  const st = document.getElementById('status');
+  btn.classList.add('spinning');
+  btn.disabled = true;
+  st.className = 'waiting';
+  st.textContent = '⏳ Cookie-Refresh wird gestartet… Captcha erscheint gleich.';
+
+  fetch('{{ bridge_url }}/captcha-request-new', {method: 'POST'})
+  .then(r => r.json())
+  .then(d => {
+    if (d.ok) {
+      // Poll until captcha is active, then reload
+      pollForCaptcha();
+    } else {
+      btn.classList.remove('spinning');
+      btn.disabled = false;
+      st.className = 'err';
+      st.textContent = '❌ ' + (d.error || 'Fehler beim Starten');
+    }
+  })
+  .catch(e => {
+    btn.classList.remove('spinning');
+    btn.disabled = false;
+    st.className = 'err';
+    st.textContent = '❌ Verbindungsfehler: ' + e.message;
+  });
+}
+
+function pollForCaptcha() {
+  let attempts = 0;
+  const maxAttempts = 60; // max 60s
+  const iv = setInterval(() => {
+    attempts++;
+    fetch('{{ bridge_url }}/captcha-status')
+    .then(r => r.json())
+    .then(d => {
+      if (d.active) {
+        clearInterval(iv);
+        window.location.reload();
+      } else if (attempts >= maxAttempts) {
+        clearInterval(iv);
+        const st = document.getElementById('status');
+        const btn = document.getElementById('refreshBtn');
+        btn.classList.remove('spinning');
+        btn.disabled = false;
+        st.className = 'err';
+        st.textContent = '❌ Timeout – Captcha wurde nicht angefordert.';
+      }
+    })
+    .catch(() => {});
+  }, 1000);
+}
 </script></body></html>""", sitekey=sitekey, bridge_url=bridge_url, active=active)
 
 
@@ -4567,6 +4708,31 @@ def captcha_callback():
     _pending_captcha_event.set()
     print(f"[CAPTCHA] ✅ Manueller Token empfangen: {token[:30]}...")
     return jsonify({"ok": True, "message": "Token empfangen – Login wird durchgeführt"})
+
+
+@app.route("/captcha-request-new", methods=["POST"])
+def captcha_request_new():
+    """Startet einen neuen Cookie-Refresh im Hintergrund (triggert neues Captcha)."""
+    if _captcha_request_active:
+        return jsonify({"ok": True, "message": "Captcha-Anforderung läuft bereits"})
+
+    # Prüfen ob FlareSolverr + Credentials konfiguriert sind
+    username = _config.get("turktorrent_username", "")
+    password = _config.get("turktorrent_password", "")
+    flaresolverr_url = _config.get("flaresolverr_url", "")
+    if not username or not password:
+        return jsonify({"ok": False, "error": "TurkTorrent Username/Passwort nicht konfiguriert"})
+    if not flaresolverr_url:
+        return jsonify({"ok": False, "error": "FlareSolverr URL nicht konfiguriert"})
+
+    # Cookie-Refresh in Background-Thread starten
+    def _bg_refresh():
+        with _cookie_refresh_lock:
+            _do_cookie_refresh()
+
+    t = threading.Thread(target=_bg_refresh, daemon=True)
+    t.start()
+    return jsonify({"ok": True, "message": "Cookie-Refresh gestartet – Captcha erscheint gleich"})
 
 
 @app.route("/captcha-status")
