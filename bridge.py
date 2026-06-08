@@ -691,11 +691,18 @@ def _update_jackett_indexer_cookie(cookie: str, user_agent: str) -> dict:
         headers = {"Content-Type": "application/json"}
         params = {"apikey": jackett_api_key}
 
-        resp = session.get(config_url, params=params, timeout=10)
+        resp = session.get(config_url, params=params, timeout=10, allow_redirects=True)
         if resp.status_code == 302:
             return {"ok": False, "error": "Jackett Admin-Login fehlgeschlagen – falsches Passwort? (jackett_admin_password prüfen)"}
         if not resp.ok:
             return {"ok": False, "error": f"Jackett Config GET HTTP {resp.status_code}: {resp.text[:100]}"}
+
+        # HTML-Response erkennen (Login-Seite statt JSON → Admin-Passwort fehlt/falsch)
+        content_type = resp.headers.get("Content-Type", "")
+        if "text/html" in content_type or resp.text.strip().startswith("<"):
+            if not jackett_admin_password:
+                return {"ok": False, "error": "Jackett Admin-Passwort nicht konfiguriert – bitte in der GUI unter Indexer eintragen"}
+            return {"ok": False, "error": "Jackett Admin-Login fehlgeschlagen – Passwort prüfen (jackett_admin_password)"}
 
         try:
             config_items = resp.json()
@@ -2426,6 +2433,45 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 </style>
 </head>
 <body>
+<!-- Captcha Notification Banner -->
+<div id="captchaBanner" style="display:none;position:fixed;top:0;left:0;right:0;z-index:9999;background:linear-gradient(135deg,#2a1a0a,#3a2010);border-bottom:2px solid #f59e0b;padding:12px 20px;text-align:center;animation:slideDown .4s ease-out;box-shadow:0 4px 24px rgba(245,158,11,.25)">
+<style>
+@keyframes slideDown{from{transform:translateY(-100%);opacity:0}to{transform:translateY(0);opacity:1}}
+@keyframes captchaPulse{0%,100%{opacity:1}50%{opacity:.6}}
+#captchaBanner .cb-inner{display:flex;align-items:center;justify-content:center;gap:12px;flex-wrap:wrap}
+#captchaBanner .cb-icon{font-size:1.4rem;animation:captchaPulse 1.5s ease-in-out infinite}
+#captchaBanner .cb-text{color:#fbbf24;font-size:.9rem;font-weight:600}
+#captchaBanner .cb-btn{background:#f59e0b;color:#1a1a1a;border:none;padding:6px 16px;border-radius:8px;font-size:.82rem;font-weight:700;cursor:pointer;text-decoration:none;transition:all .2s}
+#captchaBanner .cb-btn:hover{background:#fbbf24;transform:scale(1.05)}
+#captchaBanner .cb-close{position:absolute;right:12px;top:50%;transform:translateY(-50%);background:none;border:none;color:#fbbf2480;font-size:1.2rem;cursor:pointer;padding:4px 8px}
+#captchaBanner .cb-close:hover{color:#fbbf24}
+</style>
+<div class="cb-inner">
+<span class="cb-icon">🔐</span>
+<span class="cb-text">hCaptcha-Lösung benötigt – TurkTorrent Session abgelaufen</span>
+<a class="cb-btn" href="/captcha" target="_blank">Captcha jetzt lösen</a>
+</div>
+<button class="cb-close" onclick="document.getElementById('captchaBanner').style.display='none'">&times;</button>
+</div>
+<script>
+(function(){
+  let _lastCaptchaState = false;
+  function pollCaptcha(){
+    fetch('/captcha-status').then(r=>r.json()).then(d=>{
+      const banner = document.getElementById('captchaBanner');
+      if(d.active && d.waiting){
+        if(!_lastCaptchaState) banner.style.display='block';
+        _lastCaptchaState = true;
+      } else {
+        banner.style.display='none';
+        _lastCaptchaState = false;
+      }
+    }).catch(()=>{});
+  }
+  setInterval(pollCaptcha, 10000);
+  setTimeout(pollCaptcha, 2000);
+})();
+</script>
 <div class="header">
 <div class="lang-switcher">
 <button class="lang-btn" id="lang-de" onclick="setLang('de')" title="Deutsch">🇩🇪</button>
