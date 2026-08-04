@@ -55,6 +55,7 @@ The bridge:
 - 🔍 **Automatic title translation** — International ↔ Turkish (via TVDB)
 - 🧠 **Self-learning** — learns new titles from TVDB lookups and persists them
 - 📦 **BoxSet fallback** — auto-downloads complete series BoxSets via qBittorrent when no season pack exists
+- 🔄 **Version-robust qBittorrent WebAPI** — supports legacy responses as well as qBittorrent 5.2+ (`204` responses and port-specific session cookies)
 - 🎬 **Quality prioritization** — 2160p > 1080p > 720p > SD, H.265 bonus
 - ✏️ **Title rewrite** — rewrites torrent titles in XML so Radarr/Sonarr can match Turkish titles
 - 📨 **Telegram notifications** — for automatic BoxSet downloads
@@ -247,6 +248,12 @@ New titles are learned automatically via TVDB lookups.
 - Jackett (with a Turkish indexer, e.g. TürkTorrent)
 - qBittorrent (optional, for BoxSet auto-download)
 
+The qBittorrent integration keeps the complete cookie session returned by the
+WebAPI and verifies it through an authenticated API call. It deliberately does
+not depend on a fixed cookie name or on the legacy `Ok.` login response, so
+qBittorrent upgrades can change those implementation details without breaking
+the bridge.
+
 ---
 
 ## License
@@ -258,5 +265,4 @@ MIT License — see [LICENSE](LICENSE)
 *Built for the Turkish home cinema setup. Contributions welcome!* 🇹🇷
 
 ---
-
 

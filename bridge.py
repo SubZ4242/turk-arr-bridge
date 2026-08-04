@@ -20,6 +20,7 @@ import urllib.parse
 import threading
 from typing import Optional
 from datetime import datetime, timedelta
+from email.utils import format_datetime
 from pathlib import Path
 
 import requests
@@ -141,6 +142,10 @@ QBIT_PASS = _config["qbit_pass"]
 TELEGRAM_BOT_TOKEN = _config["telegram_bot_token"]
 TELEGRAM_CHAT_ID = _config["telegram_chat_id"]
 BOXSET_AUTO_DOWNLOAD = _config.get("boxset_auto_download", True)
+# Sicherheitsgrenze: Die Bridge ist ein Suchproxy und darf keine Downloads
+# ausloesen. Automatische Boxsets werden ausschliesslich vom Bot mit seiner
+# zusaetzlichen Serienidentitaetspruefung verarbeitet.
+BRIDGE_DIRECT_DOWNLOADS_ENABLED = False
 BOXSET_PREFER_SEEDERS = _config.get("boxset_prefer_seeders", False)
 TELEGRAM_ENABLED = _config.get("telegram_enabled", True)
 TURKTORRENT_USERNAME = _config.get("turktorrent_username", "")
@@ -157,6 +162,7 @@ FLARESOLVERR_URL = _config.get("flaresolverr_url", "")
 
 _cookie_refresh_lock = threading.Lock()
 _cookie_refresh_thread: Optional[threading.Thread] = None
+_login_attempt_lock = threading.Lock()
 
 # Manuelles hCaptcha: Bridge wartet auf Token vom User (via Telegram-Link)
 _pending_captcha_token: Optional[str] = None
@@ -234,7 +240,34 @@ def _request_manual_captcha(site_url: str, timeout_minutes: int = 10) -> dict:
         _pending_captcha_event.clear()
 
 
-def _turktorrent_login(username: str, password: str, site_url: str, flaresolverr_url: str = "", captcha_token: str = "") -> dict:
+def _turktorrent_login(username: str, password: str, site_url: str,
+                       flaresolverr_url: str = "", captcha_token: str = "") -> dict:
+    """Fuehrt hoechstens einen Tracker-Login/Captcha-Dialog gleichzeitig aus.
+
+    GUI-Test, manueller Refresh und Auto-Refresh koennen denselben Login fast
+    zeitgleich starten. Da hCaptcha-Tokens nur einmal verwendbar sind, darf ein
+    zweiter Versuch den gemeinsamen Callback-Zustand nicht zuruecksetzen.
+    """
+    if not _login_attempt_lock.acquire(blocking=False):
+        return {
+            "ok": False,
+            "cookie": "",
+            "user_agent": "",
+            "error": "Ein TurkTorrent Login/Captcha-Versuch läuft bereits",
+            "already_running": True,
+        }
+
+    try:
+        return _turktorrent_login_once(
+            username, password, site_url, flaresolverr_url, captcha_token
+        )
+    finally:
+        _login_attempt_lock.release()
+
+
+def _turktorrent_login_once(username: str, password: str, site_url: str,
+                            flaresolverr_url: str = "",
+                            captcha_token: str = "") -> dict:
     """
     Loggt sich bei TurkTorrent ein:
     1. FlareSolverr holt cf_clearance Cookie (Cloudflare umgehen)
@@ -803,6 +836,8 @@ def _do_cookie_refresh():
     # Login via FlareSolverr + manuelles hCaptcha
     login_result = _turktorrent_login(username, password, site_url, flaresolverr_url)
     if not login_result["ok"]:
+        if login_result.get("already_running"):
+            return login_result
         msg = f"❌ Login fehlgeschlagen: {login_result['error']}"
         _config["turktorrent_cookie_status"] = msg
         _save_config(_config)
@@ -811,6 +846,14 @@ def _do_cookie_refresh():
         return {"ok": False, "error": login_result["error"]}
 
     print(f"[COOKIE] Login erfolgreich. Cookie: {login_result['cookie'][:50]}...")
+
+    # Den frisch bestaetigten Tracker-Cookie sofort sichern. Jackett prueft beim
+    # Config-POST gleichzeitig seine HTML-Definition. Wenn sich dort nur ein
+    # Selektor geaendert hat, kann dieser Test fehlschlagen, obwohl der Login
+    # selbst erfolgreich war. Ohne die fruehe Sicherung ging der gueltige Cookie
+    # bisher verloren und der Auto-Refresh startete immer neue Captchas.
+    _config["turktorrent_current_cookie"] = login_result["cookie"]
+    _save_config(_config)
 
     # Schritt 2: Jackett aktualisieren
     update_result = _update_jackett_indexer_cookie(login_result["cookie"], login_result["user_agent"])
@@ -822,8 +865,6 @@ def _do_cookie_refresh():
         _send_telegram_alert(f"⚠️ <b>Jackett-Update fehlgeschlagen</b>\nLogin war OK, aber Cookie konnte nicht in Jackett eingetragen werden.\n{update_result['error']}")
         return {"ok": False, "error": update_result["error"]}
 
-    # Cookie für spätere Validierung speichern
-    _config["turktorrent_current_cookie"] = login_result["cookie"]
     msg = f"✅ Cookie erfolgreich aktualisiert ({datetime.now().strftime('%d.%m.%Y %H:%M')})"
     _config["turktorrent_cookie_status"] = msg
     _config["turktorrent_last_cookie_refresh"] = datetime.now().isoformat()
@@ -1210,6 +1251,61 @@ def normalize_for_search(text: str) -> str:
     return text
 
 
+def release_matches_search(title: str, search_titles: list[str]) -> bool:
+    """Prueft einen Release-Titel vor einem automatischen Download streng."""
+    def _words(value: str) -> list[str]:
+        # Release-Namen verwenden Punkte/Bindestriche als Leerzeichen. Die
+        # normale Cache-Normalisierung entfernt sie dagegen absichtlich.
+        value = strip_turkish_chars(value).lower()
+        return re.sub(r'[^a-z0-9]+', ' ', value).strip().split()
+
+    release_words = _words(title)
+    if not release_words:
+        return False
+
+    for search_title in search_titles:
+        # Das Suchjahr ist kein Bestandteil des eigentlichen Serientitels.
+        candidate = re.sub(r'\s+\d{4}$', '', search_title or '').strip()
+        wanted_words = _words(candidate)
+        # Sehr kurze Varianten sind fuer einen sicheren Auto-Download zu vage.
+        if not wanted_words or len(''.join(wanted_words)) < 4:
+            continue
+        width = len(wanted_words)
+        # Kurze Aliase duerfen verwandte Spin-offs zwar in Jackett finden,
+        # aber nur als Identitaet gelten, wenn der Release damit beginnt.
+        if width <= 2:
+            matched = release_words[:width] == wanted_words
+        else:
+            matched = any(release_words[i:i + width] == wanted_words
+                          for i in range(len(release_words) - width + 1))
+        if matched:
+            return True
+    return False
+
+
+def multi_release_covers_season(title: str, season: int) -> bool:
+    """Prueft, ob ein Multi-Season-Release die angefragte Staffel abdeckt."""
+    ranges = re.findall(r'\bS(\d{1,2})\s*-\s*S?(\d{1,2})\b', title, re.I)
+    if ranges:
+        return any(min(int(start), int(end)) <= season <= max(int(start), int(end))
+                   for start, end in ranges)
+
+    # Bei explizit als komplett bezeichneten Paketen ist keine Spanne noetig.
+    return bool(re.search(
+        r'box\s*set|t[\u00fcu]m\s*sezon|t[\u00fcu]m\s*b[\u00f6o]l[\u00fcu]m|'
+        r'b[\u00fcu]t[\u00fcu]n\s*b[\u00f6o]l[\u00fcu]m|komple|complete\s*series|all\s*seasons',
+        title, re.I
+    ))
+
+
+def release_episode_for_season(title: str, season: int) -> Optional[int]:
+    """Liest SxxExx aus einem Release und begrenzt es auf die gesuchte Staffel."""
+    match = re.search(r'\bS(\d{1,2})\s*E(\d{1,3})\b', title, re.I)
+    if match and int(match.group(1)) == season:
+        return int(match.group(2))
+    return None
+
+
 # ============================================================
 # Titel-Mapping Cache
 # ============================================================
@@ -1223,19 +1319,36 @@ class TitleCache:
     def __init__(self, ttl_seconds: int = 300):
         self.ttl = ttl_seconds
         self._cache: dict = {}  # normalized_title → {titles: [...], updated: datetime}
+        self._tvdb_titles: dict[str, str] = {}  # TVDB-ID → Sonarr-Haupttitel
         self._last_refresh: Optional[datetime] = None
 
     def _cache_key(self, title: str) -> str:
         return normalize_for_search(title)
 
     def add_mapping(self, international_title: str, alternate_titles: list[str],
-                    original_title: str = ""):
+                    original_title: str = "", tvdb_id=None):
         """Fügt ein Titel-Mapping hinzu."""
         key = self._cache_key(international_title)
         all_titles = set()
 
         # Internationaler Titel selbst
         all_titles.add(international_title)
+        # Auch der Haupttitel kann türkische Zeichen enthalten. Viele Indexer
+        # speichern Releases ausschließlich in ASCII (Doğu -> Dogu), während
+        # Sonarr den korrekten Unicode-Titel sendet. Daher immer beide Varianten.
+        ascii_international = strip_turkish_chars(international_title)
+        if ascii_international != international_title:
+            all_titles.add(ascii_international)
+
+        # Lange internationale Titel enthalten oft einen Untertitel, waehrend
+        # Tracker nur den kurzen Haupttitel fuehren ("Titel: The Story ...").
+        # Nur eindeutige Trenner verwenden, um beliebige Wortkuerzungen zu meiden.
+        for separator in (":", " - "):
+            if separator in international_title:
+                short_title = international_title.split(separator, 1)[0].strip(" .-")
+                if len(normalize_for_search(short_title)) >= 4:
+                    all_titles.add(short_title)
+                    all_titles.add(strip_turkish_chars(short_title))
 
         # Originaltitel
         if original_title:
@@ -1263,6 +1376,32 @@ class TitleCache:
                         all_titles.add(part)
                         all_titles.add(strip_turkish_chars(part))
 
+        # Punkte und Doppelpunkte werden von Tracker-Suchfeldern teils als
+        # echte Zeichen behandelt. Wortgleiche, bereinigte Varianten helfen,
+        # ohne die Titelidentitaet zu verkuerzen.
+        for known_title in list(all_titles):
+            cleaned = re.sub(r'[^\w]+', ' ', known_title, flags=re.UNICODE)
+            cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+            if cleaned and cleaned != known_title:
+                all_titles.add(cleaned)
+                all_titles.add(strip_turkish_chars(cleaned))
+
+        # Tuerkische Tracker verwenden Zahlwoerter und Ziffern wechselnd
+        # ("Yedi Numara" / "7 Numara"). Beide Formen als Suchalias fuehren.
+        number_words = {
+            "sifir": "0", "sıfır": "0", "bir": "1", "iki": "2",
+            "uc": "3", "üç": "3", "dort": "4", "dört": "4",
+            "bes": "5", "beş": "5", "alti": "6", "altı": "6",
+            "yedi": "7", "sekiz": "8", "dokuz": "9", "on": "10",
+        }
+        for known_title in list(all_titles):
+            words = known_title.split()
+            replaced = [number_words.get(word.casefold(), word) for word in words]
+            numeric_title = " ".join(replaced)
+            if numeric_title != known_title:
+                all_titles.add(numeric_title)
+                all_titles.add(strip_turkish_chars(numeric_title))
+
         # Auch für jeden Alias als Key registrieren
         for title in list(all_titles):
             alt_key = self._cache_key(title)
@@ -1274,6 +1413,13 @@ class TitleCache:
             self._cache[key] = {"titles": set(), "updated": datetime.now()}
         self._cache[key]["titles"].update(all_titles)
         self._cache[key]["updated"] = datetime.now()
+
+        if tvdb_id:
+            self._tvdb_titles[str(tvdb_id)] = international_title
+
+    def title_for_tvdb_id(self, tvdb_id) -> str:
+        """Liefert den Sonarr-Titel zu einer Torznab-TVDB-ID."""
+        return self._tvdb_titles.get(str(tvdb_id or ""), "")
 
     def get_search_titles(self, query: str) -> list[str]:
         """
@@ -1431,6 +1577,55 @@ def fetch_radarr_movies(url: str, api_key: str) -> list[dict]:
         return []
 
 
+def fetch_wikidata_titles_by_imdb(imdb_ids: list[str]) -> dict[str, set[str]]:
+    """Loest IMDb-IDs gesammelt in Original-/tuerkische Titel auf.
+
+    Sonarr/TVDB liefern bei vielen nicht-englischen Serien keinen Originaltitel.
+    Wikidata verbindet die bereits vorhandene IMDb-ID mit dem Originaltitel,
+    ohne dass serienbezogene Mappings gepflegt werden muessen.
+    """
+    valid_ids = sorted({value for value in imdb_ids
+                        if re.fullmatch(r"tt\d+", value or "")})
+    if not valid_ids:
+        return {}
+
+    values = " ".join(f'"{value}"' for value in valid_ids)
+    sparql = f"""
+        SELECT ?imdb ?itemLabel ?nativeTitle WHERE {{
+          VALUES ?imdb {{ {values} }}
+          ?item wdt:P345 ?imdb.
+          OPTIONAL {{ ?item wdt:P1476 ?nativeTitle. }}
+          SERVICE wikibase:label {{ bd:serviceParam wikibase:language "tr,en". }}
+        }}
+    """
+    try:
+        resp = requests.get(
+            "https://query.wikidata.org/sparql",
+            params={"query": sparql, "format": "json"},
+            headers={"User-Agent": "TurkARRBridge/1.0"},
+            timeout=25,
+        )
+        resp.raise_for_status()
+        mappings: dict[str, set[str]] = {}
+        for binding in resp.json().get("results", {}).get("bindings", []):
+            imdb_id = binding.get("imdb", {}).get("value", "")
+            if not imdb_id:
+                continue
+            titles = mappings.setdefault(imdb_id, set())
+            for field in ("itemLabel", "nativeTitle"):
+                title = binding.get(field, {}).get("value", "").strip()
+                if title and not title.startswith("http"):
+                    titles.add(title)
+        logger.info(
+            f"Wikidata: Originaltitel fuer {len(mappings)}/{len(valid_ids)} "
+            "IMDb-IDs geladen"
+        )
+        return mappings
+    except Exception as e:
+        logger.warning(f"Wikidata-Titelabfrage fehlgeschlagen: {e}")
+        return {}
+
+
 def _load_learned_into_cache(cache: TitleCache):
     """Lädt alle persistent gelernten Mappings in den In-Memory-Cache."""
     with _learned_db_lock:
@@ -1456,12 +1651,16 @@ def refresh_title_cache(cache: TitleCache):
 
     # Sonarr Serien
     series = fetch_sonarr_series(SONARR_URL, SONARR_API_KEY)
+    wikidata_titles = fetch_wikidata_titles_by_imdb(
+        [s.get("imdbId", "") for s in series]
+    )
     for s in series:
         title = s.get("title", "")
         alts = [a.get("title", "") for a in s.get("alternateTitles", []) if a.get("title")]
+        alts.extend(sorted(wikidata_titles.get(s.get("imdbId", ""), set())))
         original = s.get("originalTitle", "") or ""
         if title:
-            cache.add_mapping(title, alts, original)
+            cache.add_mapping(title, alts, original, tvdb_id=s.get("tvdbId"))
 
     # Radarr Filme
     movies = fetch_radarr_movies(RADARR_URL, RADARR_API_KEY)
@@ -1493,78 +1692,196 @@ ATOM_NS = "http://www.w3.org/2005/Atom"
 # qBittorrent Integration (für BoxSet Auto-Download)
 # ============================================================
 
-_qbit_sid: Optional[str] = None
-_qbit_sid_time: float = 0
+_qbit_session: Optional[requests.Session] = None
+_qbit_session_key: tuple[str, str] = ("", "")
+_qbit_session_time: float = 0
+_qbit_session_lock = threading.RLock()
 
 
-def qbit_login() -> Optional[str]:
-    """Authentifiziert bei qBittorrent und gibt das SID-Cookie zurück."""
-    global _qbit_sid, _qbit_sid_time
-    import time
-    # SID 30 Minuten cachen
-    if _qbit_sid and (time.time() - _qbit_sid_time) < 1800:
-        return _qbit_sid
+def _qbit_verify_session(session: requests.Session, base_url: str,
+                         timeout: int = 8) -> tuple[bool, str, str]:
+    """Verifiziert die Anmeldung ueber einen geschuetzten WebAPI-Endpunkt."""
     try:
-        r = requests.post(
-            f"{QBIT_URL}/api/v2/auth/login",
-            data={"username": QBIT_USER, "password": QBIT_PASS},
-            timeout=10
+        response = session.get(
+            f"{base_url}/api/v2/app/version",
+            timeout=timeout,
+            allow_redirects=False,
         )
-        if r.ok and "SID" in r.cookies:
-            _qbit_sid = r.cookies["SID"]
-            _qbit_sid_time = time.time()
-            logger.info("[QBIT] Login erfolgreich")
-            return _qbit_sid
-        logger.error(f"[QBIT] Login fehlgeschlagen: {r.status_code} {r.text[:100]}")
-    except Exception as e:
-        logger.error(f"[QBIT] Login Fehler: {e}")
-    return None
+        version = response.text.strip()
+        if response.ok and version:
+            return True, version, ""
+        return False, "", f"WebAPI-Prüfung HTTP {response.status_code}"
+    except requests.RequestException as exc:
+        return False, "", f"WebAPI nicht erreichbar: {type(exc).__name__}"
+
+
+def _qbit_invalidate_session(session: Optional[requests.Session] = None):
+    """Verwirft einen abgelaufenen oder durch ein Update ungueltigen Login."""
+    global _qbit_session, _qbit_session_key, _qbit_session_time
+    with _qbit_session_lock:
+        if session is not None and session is not _qbit_session:
+            return
+        if _qbit_session is not None:
+            try:
+                _qbit_session.close()
+            except Exception:
+                pass
+        _qbit_session = None
+        _qbit_session_key = ("", "")
+        _qbit_session_time = 0
+
+
+def qbit_connect(qbit_url: Optional[str] = None,
+                 username: Optional[str] = None,
+                 password: Optional[str] = None,
+                 force_login: bool = False
+                 ) -> tuple[Optional[requests.Session], str, str]:
+    """Oeffnet eine versionsunabhaengige qBittorrent-WebAPI-Session.
+
+    Seit qBittorrent 5.2 koennen erfolgreiche, inhaltslose API-Antworten HTTP
+    204 verwenden und das Session-Cookie enthaelt den WebUI-Port im Namen.
+    Darum wertet die Bridge weder einen festen Response-Text noch einen festen
+    Cookie-Namen aus. Entscheidend ist ausschliesslich, ob ein anschliessender
+    authentifizierter WebAPI-Aufruf funktioniert.
+    """
+    global _qbit_session, _qbit_session_key, _qbit_session_time
+
+    base_url = (QBIT_URL if qbit_url is None else qbit_url).strip().rstrip("/")
+    user = QBIT_USER if username is None else username
+    secret = QBIT_PASS if password is None else password
+    session_key = (base_url, user)
+
+    if not base_url:
+        return None, "", "qBittorrent URL nicht konfiguriert"
+
+    with _qbit_session_lock:
+        if (not force_login and _qbit_session is not None
+                and _qbit_session_key == session_key
+                and time.time() - _qbit_session_time < 1800):
+            ok, version, error = _qbit_verify_session(_qbit_session, base_url)
+            if ok:
+                return _qbit_session, version, ""
+            logger.info(f"[QBIT] Gespeicherte Session ungültig: {error}")
+            _qbit_invalidate_session(_qbit_session)
+
+        session = requests.Session()
+        parsed = urllib.parse.urlsplit(base_url)
+        if parsed.scheme and parsed.netloc:
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            # Von qBittorrent fuer Host-/CSRF-Pruefungen empfohlen.
+            session.headers.update({"Origin": origin, "Referer": origin + "/"})
+
+        try:
+            login_response = session.post(
+                f"{base_url}/api/v2/auth/login",
+                data={"username": user, "password": secret},
+                timeout=12,
+                allow_redirects=False,
+            )
+        except requests.RequestException as exc:
+            session.close()
+            return None, "", f"Login nicht erreichbar: {type(exc).__name__}"
+
+        login_body = login_response.text.strip().casefold()
+        if (not login_response.ok
+                or login_body in ("fails.", "fail.", "forbidden")):
+            error = f"Login fehlgeschlagen (HTTP {login_response.status_code})"
+            session.close()
+            return None, "", error
+
+        ok, version, error = _qbit_verify_session(session, base_url)
+        if not ok:
+            session.close()
+            return None, "", error or "Login konnte nicht bestätigt werden"
+
+        _qbit_invalidate_session()
+        _qbit_session = session
+        _qbit_session_key = session_key
+        _qbit_session_time = time.time()
+        logger.info(f"[QBIT] Login erfolgreich, qBittorrent {version}")
+        return session, version, ""
+
+
+def qbit_login() -> Optional[requests.Session]:
+    """Kompatibilitaets-Wrapper fuer den produktiven qBittorrent-Login."""
+    session, _version, error = qbit_connect()
+    if session is None:
+        logger.error(f"[QBIT] Login fehlgeschlagen: {error}")
+    return session
 
 
 def qbit_add_torrent(torrent_url: str, category: str = "tv-tr-boxset") -> bool:
     """Fügt einen Torrent (per URL) in qBittorrent hinzu. Download-Pfad wird von qBit bestimmt."""
-    sid = qbit_login()
-    if not sid:
+    session = qbit_login()
+    if session is None:
         return False
     try:
-        # Zuerst die .torrent-Datei von Jackett herunterladen
-        dl_resp = requests.get(torrent_url, timeout=30)
-        if not dl_resp.ok:
-            logger.error(f"[QBIT] Torrent-Download fehlgeschlagen: {dl_resp.status_code}")
-            return False
+        base_url = QBIT_URL.strip().rstrip("/")
+        files = None
+        data = {"category": category, "paused": "false"}
 
-        content_type = dl_resp.headers.get("Content-Type", "")
-        is_torrent_file = b"d8:" in dl_resp.content[:20] or "bittorrent" in content_type
-
-        if is_torrent_file:
-            # .torrent-Datei als Multipart upload
-            r = requests.post(
-                f"{QBIT_URL}/api/v2/torrents/add",
-                cookies={"SID": sid},
-                files={"torrents": ("boxset.torrent", dl_resp.content, "application/x-bittorrent")},
-                data={
-                    "category": category,
-                    "paused": "false",
-                },
-                timeout=15
-            )
+        if torrent_url.lower().startswith("magnet:"):
+            data["urls"] = torrent_url
         else:
-            # Magnet-Link oder URL
-            r = requests.post(
-                f"{QBIT_URL}/api/v2/torrents/add",
-                cookies={"SID": sid},
-                data={
-                    "urls": torrent_url,
-                    "category": category,
-                    "paused": "false",
-                },
-                timeout=15
+            # Private Jackett-Links zuerst mit Jacketts Berechtigung laden und
+            # anschliessend als Datei an qBittorrent uebertragen.
+            dl_resp = requests.get(torrent_url, timeout=30)
+            if not dl_resp.ok:
+                logger.error(
+                    f"[QBIT] Torrent-Download fehlgeschlagen: {dl_resp.status_code}"
+                )
+                return False
+
+            content_type = dl_resp.headers.get("Content-Type", "").lower()
+            is_torrent_file = (
+                dl_resp.content.startswith(b"d")
+                or "bittorrent" in content_type
+                or "octet-stream" in content_type
+            )
+            if not is_torrent_file:
+                logger.error(
+                    f"[QBIT] Jackett lieferte keine Torrent-Datei "
+                    f"(Content-Type: {content_type or 'unbekannt'})"
+                )
+                return False
+            files = {
+                "torrents": (
+                    "boxset.torrent",
+                    dl_resp.content,
+                    "application/x-bittorrent",
+                )
+            }
+
+        def _add(active_session: requests.Session):
+            return active_session.post(
+                f"{base_url}/api/v2/torrents/add",
+                files=files,
+                data=data,
+                timeout=20,
+                allow_redirects=False,
             )
 
-        if r.ok and "Ok" in r.text:
-            logger.info(f"[QBIT] Torrent hinzugefügt: {save_path}")
+        response = _add(session)
+        if response.status_code in (401, 403):
+            # Ein qBittorrent-Restart invalidiert gecachte Sessions. Genau
+            # einmal neu anmelden und den Add-Aufruf wiederholen.
+            _qbit_invalidate_session(session)
+            session, _version, error = qbit_connect(force_login=True)
+            if session is None:
+                logger.error(f"[QBIT] Re-Login fehlgeschlagen: {error}")
+                return False
+            response = _add(session)
+
+        response_body = response.text.strip().casefold()
+        if response.ok and (not response_body or response_body.startswith("ok")):
+            logger.info(
+                f"[QBIT] Torrent erfolgreich hinzugefügt (Kategorie: {category})"
+            )
             return True
-        logger.error(f"[QBIT] Add fehlgeschlagen: {r.status_code} {r.text[:100]}")
+        logger.error(
+            f"[QBIT] Add fehlgeschlagen: {response.status_code} "
+            f"{response.text[:100]}"
+        )
     except Exception as e:
         logger.error(f"[QBIT] Fehler: {e}")
     return False
@@ -1592,6 +1909,21 @@ def send_telegram(message: str, parse_mode: str = "HTML"):
         logger.error(f"[TELEGRAM] Fehler: {e}")
 
 
+class UpstreamTorznabError(RuntimeError):
+    """Strukturierter Upstream-Fehler, den die Bridge an ARR melden kann."""
+
+    def __init__(self, message: str, body: bytes = b"",
+                 content_type: str = "application/xml; charset=UTF-8"):
+        super().__init__(message)
+        self.body = body
+        self.content_type = content_type
+
+
+def _torznab_error_xml(message: str) -> bytes:
+    error = etree.Element("error", code="900", description=message[:500])
+    return etree.tostring(error, xml_declaration=True, encoding="UTF-8")
+
+
 def fetch_torznab(query: str, params: dict) -> Optional[bytes]:
     """Führt eine Torznab-Suche beim Upstream-Indexer durch."""
     upstream_params = dict(params)
@@ -1600,10 +1932,129 @@ def fetch_torznab(query: str, params: dict) -> Optional[bytes]:
 
     try:
         resp = requests.get(UPSTREAM_TORZNAB_URL, params=upstream_params, timeout=60)
-        resp.raise_for_status()
+        if not resp.ok:
+            message = f"Jackett HTTP {resp.status_code}"
+            try:
+                error_doc = etree.fromstring(resp.content)
+                description = error_doc.get("description")
+                if description:
+                    message = description.splitlines()[0][:500]
+            except Exception:
+                pass
+            logger.error(
+                f"Upstream Torznab Fehler für query='{query}': {message}"
+            )
+            body = resp.content if resp.content.strip().startswith(b"<?xml") else (
+                _torznab_error_xml(message)
+            )
+            raise UpstreamTorznabError(
+                message,
+                body=body,
+                content_type=resp.headers.get(
+                    "Content-Type", "application/xml; charset=UTF-8"
+                ),
+            )
         return resp.content
-    except Exception as e:
+    except UpstreamTorznabError:
+        raise
+    except requests.RequestException as e:
         logger.error(f"Upstream Torznab Fehler für query='{query}': {e}")
+        message = f"Jackett nicht erreichbar: {type(e).__name__}"
+        raise UpstreamTorznabError(
+            message,
+            body=_torznab_error_xml(message),
+        ) from e
+
+
+def fetch_jackett_json_as_torznab(query: str) -> Optional[bytes]:
+    """Holt Jacketts vollstaendige JSON-Suche und konvertiert sie zu Torznab.
+
+    Einige Indexer liefern ueber den Torznab-Endpunkt weniger Treffer als ueber
+    Jacketts native Results-API. Dieser Fallback wird nur fuer breite
+    Staffel-Suchen verwendet.
+    """
+    if not JACKETT_URL or not JACKETT_API_KEY:
+        return None
+
+    indexer_id = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
+    url = f"{JACKETT_URL.rstrip('/')}/api/v2.0/indexers/{indexer_id}/results"
+    try:
+        resp = requests.get(
+            url,
+            params={"apikey": JACKETT_API_KEY, "Query": query, "Type": "search"},
+            timeout=60,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if isinstance(data, dict):
+            indexer_errors = [
+                str(indexer.get("Error") or "").splitlines()[0]
+                for indexer in data.get("Indexers", [])
+                if indexer.get("Error")
+            ]
+            if indexer_errors:
+                raise RuntimeError(indexer_errors[0][:500])
+        results = data.get("Results", []) if isinstance(data, dict) else data
+
+        nsmap = {"torznab": TORZNAB_NS}
+        rss = etree.Element("rss", version="2.0", nsmap=nsmap)
+        channel = etree.SubElement(rss, "channel")
+        etree.SubElement(channel, "title").text = "TurkARRBridge Jackett JSON"
+
+        for result in results:
+            title = str(result.get("Title") or "").strip()
+            link = str(result.get("Link") or result.get("MagnetUri") or "").strip()
+            guid = str(result.get("Guid") or link or "").strip()
+            if not title or not guid:
+                continue
+
+            item = etree.SubElement(channel, "item")
+            etree.SubElement(item, "title").text = title
+            etree.SubElement(item, "guid", isPermaLink="false").text = guid
+            etree.SubElement(item, "link").text = link
+            details = str(result.get("Details") or "")
+            if details:
+                etree.SubElement(item, "comments").text = details
+
+            published = result.get("PublishDate")
+            if published:
+                try:
+                    pub_dt = datetime.fromisoformat(str(published).replace("Z", "+00:00"))
+                    etree.SubElement(item, "pubDate").text = format_datetime(pub_dt)
+                except (TypeError, ValueError):
+                    pass
+
+            size = int(result.get("Size") or 0)
+            etree.SubElement(item, "size").text = str(size)
+            if link:
+                etree.SubElement(
+                    item,
+                    "enclosure",
+                    url=link,
+                    length=str(size),
+                    type="application/x-bittorrent",
+                )
+
+            seeders = int(result.get("Seeders") or 0)
+            leechers = int(result.get("Peers") or 0)
+            attrs = {
+                "category": "5000",
+                "size": str(size),
+                "seeders": str(seeders),
+                # Torznab definiert peers als Gesamtzahl. Jacketts JSON-Feld
+                # Peers enthaelt bei diesem Indexer nur die Leecher.
+                "peers": str(seeders + leechers),
+                "grabs": str(int(result.get("Grabs") or 0)),
+                "downloadvolumefactor": str(result.get("DownloadVolumeFactor", 1.0)),
+                "uploadvolumefactor": str(result.get("UploadVolumeFactor", 1.0)),
+            }
+            for name, value in attrs.items():
+                etree.SubElement(item, f"{{{TORZNAB_NS}}}attr", name=name, value=value)
+
+        logger.info(f"[JACKETT-JSON] {len(results)} Treffer fuer '{query}' geladen")
+        return etree.tostring(rss, xml_declaration=True, encoding="UTF-8")
+    except Exception as e:
+        logger.error(f"Jackett JSON-Fallback fuer query='{query}' fehlgeschlagen: {e}")
         return None
 
 
@@ -1757,9 +2208,21 @@ def torznab_proxy():
 
     logger.info(f"Eingehende Anfrage: t={t}, q='{query}', params={list(params.keys())}")
 
-    # Für caps, register etc. direkt weiterleiten
+    # Sonarr sendet bei interaktiven Suchen normalerweise nur die TVDB-ID.
+    # Der TürkTorrent-Indexer kann diese ID nicht selbst in einen Titel auflösen,
+    # deshalb muss die Bridge sie vor der Upstream-Suche übersetzen.
+    if t == "tvsearch" and not query and params.get("tvdbid"):
+        query = title_cache.title_for_tvdb_id(params.get("tvdbid"))
+        if query:
+            params["q"] = query
+            # Die ID nicht an einen Indexer weitergeben, der keine ID-Suche kann.
+            params.pop("tvdbid", None)
+            logger.info(
+                f"TVDB-ID {request.args.get('tvdbid')} zu '{query}' aufgelöst"
+            )
+
+    # Nicht titelbasierte Requests direkt weiterleiten.
     if t in ("caps", "register", "tvsearch", "movie") and not query:
-        # tvsearch und movie ohne q können tvdbid/imdbid nutzen - direkt weiterleiten
         params["apikey"] = JACKETT_API_KEY
         try:
             resp = requests.get(UPSTREAM_TORZNAB_URL, params=params, timeout=60)
@@ -1843,10 +2306,24 @@ def torznab_proxy():
 
     # Parallele Suchen durchführen
     xml_results = []
+    upstream_errors = []
     for search_title in unique_titles:
-        result = fetch_torznab(search_title, search_params)
-        if result:
-            xml_results.append(result)
+        try:
+            result = fetch_torznab(search_title, search_params)
+            if result:
+                xml_results.append(result)
+        except UpstreamTorznabError as e:
+            upstream_errors.append(e)
+
+    # Ein kaputter Indexer ist keine erfolgreiche Suche mit null Treffern.
+    # Sonarr/Radarr sollen den echten Fehler sehen und spaeter erneut versuchen.
+    if not xml_results and upstream_errors:
+        upstream_error = upstream_errors[0]
+        return Response(
+            upstream_error.body,
+            status=502,
+            content_type=upstream_error.content_type,
+        )
 
     # Ergebnisse mergen
     merged = merge_torznab_results(xml_results)
@@ -1860,17 +2337,22 @@ def torznab_proxy():
         pass
 
     # ── Boxset-Fallback ──────────────────────────────────────────────
-    # Wenn tvsearch mit season-Parameter wenige Ergebnisse liefert:
-    # 1. Breite Suche → Season-Packs + BoxSets finden
-    # 2. Season-Packs an Sonarr weiterreichen (die versteht Sonarr)
-    # 3. Wenn NUR Multi-Season BoxSets → direkt an qBittorrent senden
+    # Jede tvsearch mit season-Parameter vollstaendig anreichern:
+    # 1. Torznab kann trotz vorhandener Treffer weitere Episoden unterschlagen.
+    # 2. Native Jackett-Suche + breite Suche liefern die Gesamtmenge.
+    # 3. Passende Episoden/Season-Packs werden dedupliziert ergaenzt.
+    # 4. Wenn GAR KEINE nutzbaren Releases, aber ein Multi-Season BoxSet
+    #    existiert, kann dieses optional direkt an qBittorrent gesendet werden.
     #    (Sonarr meldet "Multi-season releases are not supported")
     season_param = params.get("season", "") or params.get("se", "")
     ep_param = params.get("ep", "")
     is_tvsearch = t in ("tvsearch", "search")
 
-    if is_tvsearch and season_param and item_count < 3:
-        logger.info(f"[BOXSET] Wenige Ergebnisse ({item_count}) für '{query}' S{season_param} – starte Boxset-Fallback")
+    if is_tvsearch and season_param:
+        logger.info(
+            f"[ENRICH] {item_count} Torznab-Ergebnis(se) fuer '{query}' "
+            f"S{season_param} – ergaenze vollstaendige Jackett-Suche"
+        )
 
         # Breite Suche ohne season/ep/cat-Filter (Kategorien können BoxSets verstecken)
         boxset_params = {k: v for k, v in search_params.items()
@@ -1879,9 +2361,20 @@ def torznab_proxy():
 
         boxset_results = []
         for search_title in unique_titles:
-            result = fetch_torznab(search_title, boxset_params)
-            if result:
-                boxset_results.append(result)
+            try:
+                result = fetch_torznab(search_title, boxset_params)
+                if result:
+                    boxset_results.append(result)
+            except UpstreamTorznabError as e:
+                logger.warning(
+                    f"[ENRICH] Breite Suche fuer '{search_title}' "
+                    f"fehlgeschlagen: {e}"
+                )
+            # Native Jackett-Suche ergaenzt Treffer, die beim Torznab-Endpoint
+            # einzelner Indexer fehlen. Das Merge dedupliziert ueber die GUID.
+            json_result = fetch_jackett_json_as_torznab(search_title)
+            if json_result:
+                boxset_results.append(json_result)
 
         if boxset_results:
             boxset_merged = merge_torznab_results(boxset_results)
@@ -1900,15 +2393,19 @@ def torznab_proxy():
                     re.compile(r't[üu]m\s*b[öo]l[üu]m', re.IGNORECASE),      # Tüm Bölümler
                     re.compile(r'b[üu]t[üu]n\s*b[öo]l[üu]m', re.IGNORECASE),  # Bütün Bölümler
                     re.compile(r'komple', re.IGNORECASE),                       # Komple (= Komplett)
-                    re.compile(r'S\d+-S\d+', re.IGNORECASE),
+                    # Ueblich sind sowohl S01-S03 als auch S01-03.
+                    re.compile(r'S\d{1,2}\s*-\s*S?\d{1,2}', re.IGNORECASE),
                     re.compile(r'complete\s*series', re.IGNORECASE),
                     re.compile(r'all\s*seasons', re.IGNORECASE),
                 ]
 
                 # Patterns: Einzelne Season-Packs (Sonarr versteht diese)
                 single_season_patterns = [
-                    re.compile(rf'S{season_num}\b(?!\s*E\d)(?!.*S\d{{2}})', re.IGNORECASE),
-                    re.compile(rf'Sezon\s*{season_num}\b', re.IGNORECASE),
+                    re.compile(
+                        rf'S{season_num}\b(?!\s*E\d)(?!\s*-\s*S?\d{{1,2}})(?!.*S\d{{2}})',
+                        re.IGNORECASE
+                    ),
+                    re.compile(rf'Sezon\s*0?{int(season_param)}\b', re.IGNORECASE),
                     re.compile(rf'(?:^|\s){int(season_param)}\.\s*Sezon', re.IGNORECASE),
                 ]
 
@@ -1923,7 +2420,9 @@ def torznab_proxy():
                     pass
 
                 season_packs = []   # Sonarr-kompatibel (einzelne Staffel)
+                season_episodes = []  # Einzelne Folgen der angefragten Staffel
                 multi_boxsets = []  # Sonarr-inkompatibel (Multi-Season)
+                rejected_unrelated = []
 
                 for item in boxset_items:
                     title_el = item.findtext("title", "")
@@ -1932,10 +2431,16 @@ def torznab_proxy():
                     if guid_text in existing_guids:
                         continue
 
+                    # Breite Indexer-Suchen koennen beliebige populaere Releases
+                    # liefern. Fremde Titel duerfen niemals automatisch in qBit.
+                    if not release_matches_search(title_el, unique_titles):
+                        rejected_unrelated.append(title_el)
+                        continue
+
                     # Zuerst prüfen: Multi-Season BoxSet?
                     is_multi = any(p.search(title_el) for p in multi_season_patterns)
 
-                    if is_multi:
+                    if is_multi and multi_release_covers_season(title_el, int(season_param)):
                         size_el = item.findtext("size", "0")
                         seeders = "0"
                         for attr in item.findall("{http://torznab.com/schemas/2015/feed}attr"):
@@ -1950,32 +2455,58 @@ def torznab_proxy():
                         existing_guids.add(guid_text)
                         continue
 
+                    # Einzelfolgen aus der breiten/JSON-Suche ebenfalls an
+                    # Sonarr geben. Bei Episodensuchen nur die angefragte Folge,
+                    # bei Staffelsuchen alle Folgen dieser Staffel.
+                    release_ep = release_episode_for_season(title_el, int(season_param))
+                    if release_ep is not None:
+                        if not ep_param or release_ep == int(ep_param):
+                            season_episodes.append(item)
+                            existing_guids.add(guid_text)
+                        continue
+
                     # Dann prüfen: Einzelne Season für die gesuchte Staffel?
                     is_season = any(p.search(title_el) for p in single_season_patterns)
                     if is_season:
                         season_packs.append(item)
                         existing_guids.add(guid_text)
 
-                logger.info(f"[BOXSET] Gefunden: {len(season_packs)} Season-Pack(s), {len(multi_boxsets)} Multi-Season BoxSet(s)")
+                logger.info(
+                    f"[BOXSET] Gefunden: {len(season_episodes)} Episode(n), "
+                    f"{len(season_packs)} Season-Pack(s), "
+                    f"{len(multi_boxsets)} Multi-Season BoxSet(s); "
+                    f"{len(rejected_unrelated)} fremde Treffer verworfen"
+                )
+                if rejected_unrelated:
+                    logger.warning(
+                        f"[BOXSET] Fremde Treffer fuer '{query}' nicht verwendet: "
+                        f"{rejected_unrelated[:8]}"
+                    )
 
-                # Season-Packs an Sonarr weiterreichen (die versteht es)
-                if season_packs:
+                # Einzelne Episoden und Season-Packs an Sonarr weiterreichen.
+                sonarr_releases = season_episodes + season_packs
+                if sonarr_releases:
                     try:
                         main_tree = etree.fromstring(merged)
                         channel = main_tree.find(".//channel")
                         if channel is not None:
-                            for item in season_packs:
+                            for item in sonarr_releases:
                                 channel.append(item)
                             merged = etree.tostring(main_tree, xml_declaration=True,
                                                     encoding="UTF-8", pretty_print=True)
-                            item_count += len(season_packs)
-                            logger.info(f"[BOXSET] {len(season_packs)} Season-Pack(s) → Sonarr für '{query}' S{season_param}")
+                            item_count += len(sonarr_releases)
+                            logger.info(
+                                f"[BOXSET] {len(season_episodes)} Episode(n) + "
+                                f"{len(season_packs)} Season-Pack(s) → Sonarr "
+                                f"für '{query}' S{season_param}"
+                            )
                     except Exception as e:
                         logger.error(f"[BOXSET] Merge-Fehler: {e}")
 
                 # Wenn KEINE Season-Packs gefunden, aber BoxSets vorhanden
                 # → Bestes BoxSet direkt an qBittorrent senden (Sonarr kann's nicht)
-                if not season_packs and multi_boxsets and BOXSET_AUTO_DOWNLOAD:
+                if (item_count == 0 and not sonarr_releases and multi_boxsets
+                        and BOXSET_AUTO_DOWNLOAD and BRIDGE_DIRECT_DOWNLOADS_ENABLED):
                     # Qualitäts-Score: höher = besser
                     def _quality_score(info):
                         t = info["title"]
@@ -2171,14 +2702,39 @@ def torznab_proxy():
                 year_str = year_match.group(0)  # z.B. "(1976)" oder "1976"
                 meta_start = year_match.start()
 
-            # Falls kein Jahr gefunden: Meta beginnt beim ersten Quality-Token
+            # Staffelmarker muessen Teil des Suffix bleiben. Tuerkische Tracker
+            # verwenden neben S01 auch "Sezon 1" und "1. Sezon".
+            season_marker = re.search(
+                r'\bS\d{1,2}(?:\s*E\d{1,3})?(?:\s*-\s*S?\d{1,2})?\b|'
+                r'\bSezon\s*0?\d{1,2}\b|\b\d{1,2}\.\s*Sezon\b',
+                orig_title,
+                re.IGNORECASE,
+            )
+            if season_marker and season_marker.start() < meta_start:
+                meta_start = season_marker.start()
+
+            # Falls kein Jahr/Staffelmarker gefunden: Meta beginnt beim ersten Quality-Token
             if not year_match:
                 first_q = QUALITY_RE.search(orig_title)
-                if first_q:
+                if first_q and first_q.start() < meta_start:
                     meta_start = first_q.start()
 
             # Alles ab meta_start ist der "Suffix" (Jahr + Quality + Release-Group)
             suffix = orig_title[meta_start:].strip()
+
+            # Tuerkische Staffelnotation in Sonarrs erwartetes Sxx umwandeln.
+            suffix = re.sub(
+                r'^Sezon\s*0?(\d{1,2})\b',
+                lambda m: f"S{int(m.group(1)):02d}",
+                suffix,
+                flags=re.IGNORECASE,
+            )
+            suffix = re.sub(
+                r'^(\d{1,2})\.\s*Sezon\b',
+                lambda m: f"S{int(m.group(1)):02d}",
+                suffix,
+                flags=re.IGNORECASE,
+            )
 
             # Falls query ein Jahr enthält, aber der Orig-Titel keins hat → Jahr aus Query nehmen
             if not year_match:
@@ -2596,6 +3152,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 <div class="card"><h2><span class="tool-icon" id="tool-icon-jackett">🌐</span> Jackett</h2>
 <div class="field"><label data-i18n="lbl_url">URL</label><input id="cfg_jackett_url" placeholder="http://your-nas:9117"></div>
 <div class="field"><label data-i18n="lbl_api_key">API Key</label><input id="cfg_jackett_api_key" placeholder="API Key"></div>
+<div class="field"><label>Jackett Admin-Passwort</label><input id="cfg_jackett_admin_password" type="password" placeholder="Nur wenn das Jackett-Dashboard geschuetzt ist"><div class="hint">Das „Admin password“ aus Jackett. Für den automatischen Cookie-Eintrag erforderlich; sonst leer lassen.</div></div>
 <div class="field"><label data-i18n="lbl_torznab_url">Torznab URL</label><input id="cfg_upstream_torznab_url" placeholder="http://..."></div>
 <div class="btn-row"><button class="btn btn-primary" onclick="saveConfig()">💾 <span data-i18n="btn_save">Speichern</span></button><button class="btn btn-outline" onclick="testSingle('jackett')">🧪 <span data-i18n="btn_test">Testen</span></button></div>
 </div>
@@ -4215,13 +4772,11 @@ def gui_test_connections():
         results.append({"name": "TürkTorrent (Torznab)", "url": UPSTREAM_TORZNAB_URL[:60], "status": "err", "detail": str(e)[:80]})
     # qBittorrent
     try:
-        sess = requests.Session()
-        r = sess.post(f"{QBIT_URL}/api/v2/auth/login", data={"username": QBIT_USER, "password": QBIT_PASS}, timeout=8)
-        if r.ok and r.text.strip().upper() == "OK.":
-            ver = sess.get(f"{QBIT_URL}/api/v2/app/version", timeout=5).text.strip()
+        sess, ver, error = qbit_connect(force_login=True)
+        if sess is not None:
             results.append({"name": "qBittorrent", "url": QBIT_URL, "status": "ok", "detail": f"Version {ver}"})
         else:
-            results.append({"name": "qBittorrent", "url": QBIT_URL, "status": "err", "detail": f"Login fehlgeschlagen"})
+            results.append({"name": "qBittorrent", "url": QBIT_URL, "status": "err", "detail": error})
     except Exception as e:
         results.append({"name": "qBittorrent", "url": QBIT_URL, "status": "err", "detail": str(e)[:80]})
     # Telegram
@@ -4283,12 +4838,15 @@ def gui_test_single():
         user = data.get("qbit_user", QBIT_USER)
         pw = data.get("qbit_pass", QBIT_PASS)
         try:
-            sess = requests.Session()
-            r = sess.post(f"{url}/api/v2/auth/login", data={"username": user, "password": pw}, timeout=8)
-            if r.ok and r.text.strip().upper() == "OK.":
-                ver = sess.get(f"{url}/api/v2/app/version", timeout=5).text.strip()
+            sess, ver, error = qbit_connect(
+                qbit_url=url,
+                username=user,
+                password=pw,
+                force_login=True,
+            )
+            if sess is not None:
                 return jsonify({"status": "ok", "detail": f"qBittorrent {ver} verbunden"})
-            return jsonify({"status": "err", "detail": f"Login fehlgeschlagen: {r.text[:80]}"})
+            return jsonify({"status": "err", "detail": error})
         except Exception as e:
             return jsonify({"status": "err", "detail": str(e)[:100]})
     return jsonify({"status": "err", "detail": "Unbekannter Service"})
@@ -4759,8 +5317,11 @@ def captcha_callback():
 @app.route("/captcha-request-new", methods=["POST"])
 def captcha_request_new():
     """Startet einen neuen Cookie-Refresh im Hintergrund (triggert neues Captcha)."""
-    if _captcha_request_active:
-        return jsonify({"ok": True, "message": "Captcha-Anforderung läuft bereits"})
+    if _captcha_request_active or _login_attempt_lock.locked():
+        return jsonify({
+            "ok": True,
+            "message": "Login-/Captcha-Anforderung läuft bereits",
+        })
 
     # Prüfen ob FlareSolverr + Credentials konfiguriert sind
     username = _config.get("turktorrent_username", "")
