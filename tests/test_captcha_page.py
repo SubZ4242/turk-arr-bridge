@@ -56,6 +56,44 @@ class CaptchaPageCompatibilityTests(unittest.TestCase):
             response = bridge.app.test_client().get("/captcha-status")
         self.assertIn("no-store", response.headers["Cache-Control"])
 
+    def test_forced_captcha_test_does_not_stop_at_valid_cookie(self):
+        saved = {
+            key: bridge._config.get(key)
+            for key in (
+                "turktorrent_username",
+                "turktorrent_password",
+                "flaresolverr_url",
+                "turktorrent_current_cookie",
+            )
+        }
+        bridge._config.update({
+            "turktorrent_username": "user",
+            "turktorrent_password": "secret",
+            "flaresolverr_url": "http://flaresolverr.test",
+            "turktorrent_current_cookie": "still-valid-cookie",
+        })
+        try:
+            with patch.object(bridge, "_validate_turktorrent_cookie") as validate, patch.object(
+                bridge,
+                "_turktorrent_login",
+                return_value={
+                    "ok": False,
+                    "error": "test stopped after login was reached",
+                    "already_running": True,
+                },
+            ) as login:
+                result = bridge._do_cookie_refresh(force_login=True)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    bridge._config.pop(key, None)
+                else:
+                    bridge._config[key] = value
+
+        validate.assert_not_called()
+        login.assert_called_once()
+        self.assertIn("test stopped", result["error"])
+
 
 if __name__ == "__main__":
     unittest.main()

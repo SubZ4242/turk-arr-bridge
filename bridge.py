@@ -844,8 +844,13 @@ def _send_telegram_alert(message: str):
         print(f"[TELEGRAM] Alert fehlgeschlagen: {e}")
 
 
-def _do_cookie_refresh():
-    """Führt einen kompletten Cookie-Refresh durch: FlareSolverr Login → Jackett Update."""
+def _do_cookie_refresh(force_login: bool = False):
+    """Führt einen Cookie-Refresh durch: FlareSolverr Login → Jackett Update.
+
+    Der automatische Pfad bewahrt einen noch gültigen Cookie. Der ausdrücklich
+    angeforderte Captcha-Test kann mit ``force_login=True`` trotzdem einen neuen
+    Login starten, damit der Telegram-/Tailscale-Flow wirklich testbar ist.
+    """
     global _config
     username = _config.get("turktorrent_username", "")
     password = _config.get("turktorrent_password", "")
@@ -864,7 +869,7 @@ def _do_cookie_refresh():
 
     # Zuerst prüfen ob Cookie noch gültig ist
     current_cookie = _config.get("turktorrent_current_cookie", "")
-    if current_cookie:
+    if current_cookie and not force_login:
         validation = _validate_turktorrent_cookie(current_cookie, site_url, flaresolverr_url)
         if validation["ok"]:
             print(f"[COOKIE] Cookie noch gültig – kein Refresh nötig")
@@ -872,6 +877,8 @@ def _do_cookie_refresh():
             _save_config(_config)
             return {"ok": True, "error": ""}
         print(f"[COOKIE] Cookie abgelaufen: {validation['error']}")
+    elif current_cookie and force_login:
+        print("[COOKIE] Manueller Captcha-Test: gültigen Cookie bewusst neu anmelden")
 
     print(f"[COOKIE] Starte TurkTorrent Cookie-Refresh via FlareSolverr + manuelles hCaptcha für User '{username}'...")
 
@@ -5691,11 +5698,11 @@ def captcha_request_new():
     # Cookie-Refresh in Background-Thread starten
     def _bg_refresh():
         with _cookie_refresh_lock:
-            _do_cookie_refresh()
+            _do_cookie_refresh(force_login=True)
 
     t = threading.Thread(target=_bg_refresh, daemon=True)
     t.start()
-    return jsonify({"ok": True, "message": "Cookie-Refresh gestartet – Captcha erscheint gleich"})
+    return jsonify({"ok": True, "message": "Neuer Login gestartet – Captcha erscheint gleich"})
 
 
 @app.route("/captcha-status")
