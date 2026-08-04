@@ -95,6 +95,7 @@ def _load_config() -> dict:
         "TELEGRAM_BOT_TOKEN": "telegram_bot_token",
         "TELEGRAM_CHAT_ID": "telegram_chat_id",
         "BRIDGE_PORT": "bridge_port", "CACHE_TTL_SECONDS": "cache_ttl_seconds",
+        "BRIDGE_EXTERNAL_URL": "bridge_external_url",
         "LOG_LEVEL": "log_level",
         "ARR_INDEXER_AUTO_HEAL": "arr_indexer_auto_heal",
         "ARR_INDEXER_HEAL_INTERVAL_MINUTES": "arr_indexer_heal_interval_minutes",
@@ -177,6 +178,9 @@ _login_attempt_lock = threading.Lock()
 _pending_captcha_token: Optional[str] = None
 _pending_captcha_event = threading.Event()
 _captcha_request_active = False  # True wenn auf Captcha gewartet wird
+_DEFAULT_TURKTORRENT_HCAPTCHA_SITEKEY = "18b46fe7-6021-408e-b14c-f318dbae672a"
+_pending_captcha_sitekey = _DEFAULT_TURKTORRENT_HCAPTCHA_SITEKEY
+_pending_captcha_host = "turktorrent.us"
 
 _TURKTORRENT_PERSISTENT_COOKIE_NAMES = {
     "uid", "pass", "c_secure_uid", "c_secure_pass",
@@ -191,15 +195,36 @@ _TURKTORRENT_VOLATILE_COOKIE_NAMES = {
 }
 
 
-def _request_manual_captcha(site_url: str, timeout_minutes: int = 10) -> dict:
+def _extract_hcaptcha_sitekey(page_html: str) -> str:
+    """Liest den aktuellen öffentlichen hCaptcha-Sitekey aus dem Tracker-HTML."""
+    if not page_html:
+        return ""
+    patterns = (
+        r'data-sitekey\s*=\s*["\']([A-Za-z0-9_-]{20,100})["\']',
+        r'(?:sitekey|siteKey)\s*[:=]\s*["\']([A-Za-z0-9_-]{20,100})["\']',
+    )
+    for pattern in patterns:
+        match = re.search(pattern, page_html, flags=re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
+
+
+def _request_manual_captcha(site_url: str, timeout_minutes: int = 10,
+                            sitekey: str = "") -> dict:
     """
     Fordert den User per Telegram auf, hCaptcha manuell zu lösen.
     Wartet bis der Token über /captcha-callback eingeht.
     Gibt {"ok": bool, "token": str, "error": str} zurück.
     """
     global _pending_captcha_token, _captcha_request_active
+    global _pending_captcha_sitekey, _pending_captcha_host
     _pending_captcha_token = None
     _pending_captcha_event.clear()
+    _pending_captcha_sitekey = sitekey or _DEFAULT_TURKTORRENT_HCAPTCHA_SITEKEY
+    _pending_captcha_host = (
+        urllib.parse.urlparse(site_url).hostname or "turktorrent.us"
+    )
     _captcha_request_active = True
 
     try:
@@ -218,7 +243,9 @@ def _request_manual_captcha(site_url: str, timeout_minutes: int = 10) -> dict:
                 _local_ip = "127.0.0.1"
             bridge_host = f"http://{_local_ip}:{_config.get('bridge_port', 9696)}"
 
-        captcha_url = f"{bridge_host}/captcha"
+        # Telegram-/WebView-Caches dürfen keine alte inaktive Captcha-Seite
+        # wiederverwenden. Jede Anforderung erhält deshalb eine eindeutige URL.
+        captcha_url = f"{bridge_host}/captcha?request={int(time.time())}"
         print(f"[CAPTCHA] hCaptcha-Lösung benötigt! Link: {captcha_url}")
 
         # Telegram-Nachricht senden
@@ -322,6 +349,7 @@ def _turktorrent_login_once(username: str, password: str, site_url: str,
         fs_cookies = {c["name"]: c["value"] for c in solution1.get("cookies", []) if c.get("name") and c.get("value")}
         cf_clearance = fs_cookies.get("cf_clearance", "")
         page_html = solution1.get("response", "")
+        captcha_sitekey = _extract_hcaptcha_sitekey(page_html)
 
         if not cf_clearance:
             _cleanup_flaresolverr_session(fs_api, session_id)
@@ -353,6 +381,9 @@ def _turktorrent_login_once(username: str, password: str, site_url: str,
         resp_get = http_session.get(site_url.rstrip("/") + "/", timeout=20)
         stkey = ""
         if resp_get.ok and "challenge" not in resp_get.text[:500].lower():
+            captcha_sitekey = (
+                _extract_hcaptcha_sitekey(resp_get.text) or captcha_sitekey
+            )
             stkey_match2 = re.search(r'stKey:\s*"([^"]+)"', resp_get.text)
             if stkey_match2:
                 stkey = stkey_match2.group(1)
@@ -374,7 +405,9 @@ def _turktorrent_login_once(username: str, password: str, site_url: str,
             captcha_result = {"ok": True, "token": captcha_token, "error": ""}
         else:
             print("[COOKIE] Schritt 2: hCaptcha manuell lösen (Telegram)...")
-            captcha_result = _request_manual_captcha(site_url)
+            captcha_result = _request_manual_captcha(
+                site_url, sitekey=captcha_sitekey
+            )
 
         if not captcha_result["ok"]:
             return {"ok": False, "cookie": "", "user_agent": "", "error": f"hCaptcha lösen fehlgeschlagen: {captcha_result['error']}"}
@@ -3435,6 +3468,7 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
 <div>
 <div class="field"><label>🤖 FlareSolverr URL</label><input id="cfg_flaresolverr_url" placeholder="http://localhost:8191"></div>
+<div class="field"><label>🔗 Captcha-/Tailscale-URL</label><input id="cfg_bridge_external_url" placeholder="https://dein-nas.tailnet-name.ts.net"><div class="hint">Optional: die vom Handy erreichbare vollständige Bridge-URL. Sie wird für den Telegram-Captcha-Link verwendet.</div></div>
 <div class="field"><label>👤 TurkTorrent Benutzername</label><input id="cfg_turktorrent_username" placeholder="dein TurkTorrent Username"></div>
 <div class="field"><label>🔑 TurkTorrent Passwort</label><input id="cfg_turktorrent_password" type="password" placeholder="dein TurkTorrent Passwort"></div>
 </div>
@@ -5432,22 +5466,29 @@ def gui_logs():
 
 @app.route("/captcha")
 def captcha_page():
-    """Minimale Handy-freundliche Seite mit NUR dem hCaptcha-Widget."""
-    sitekey = "18b46fe7-6021-408e-b14c-f318dbae672a"
-    bridge_url = request.host_url.rstrip("/")
+    """Handy-freundliche, Tailscale-/Reverse-Proxy-feste Captcha-Seite."""
+    sitekey = _pending_captcha_sitekey or _DEFAULT_TURKTORRENT_HCAPTCHA_SITEKEY
+    captcha_host = _pending_captcha_host or "turktorrent.us"
     active = _captcha_request_active
-    return render_template_string("""<!DOCTYPE html>
+    captcha_api_url = "https://hcaptcha.com/1/api.js?" + urllib.parse.urlencode({
+        "hl": "tr",
+        # Die Originalseite lädt dasselbe Sitekey ausdrücklich für diesen Host.
+        # Ohne den Host-Hinweis kann ein Widget auf Tailscale-/IP-URLs leer bleiben.
+        "host": captcha_host,
+        "render": "explicit",
+        "onload": "renderCaptcha",
+    })
+    html = render_template_string("""<!DOCTYPE html>
 <html lang="de"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>🔐 TurkTorrent Captcha</title>
-<script src="https://js.hcaptcha.com/1/api.js" async defer></script>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1923;color:#e8eaed;display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;padding:20px}
 .card{background:#1a2332;border-radius:16px;padding:28px;max-width:400px;width:100%;text-align:center;box-shadow:0 8px 32px rgba(0,0,0,.4);position:relative}
 h1{font-size:1.3rem;margin-bottom:6px}
 .sub{color:#8899aa;font-size:.85rem;margin-bottom:20px}
-.h-captcha{display:inline-block;margin:16px 0}
+.h-captcha{display:flex;justify-content:center;min-height:78px;margin:16px 0}
 #status{margin-top:16px;padding:12px;border-radius:10px;font-size:.9rem;display:none}
 .ok{background:#1a3a2a;color:#4ade80;display:block!important}
 .err{background:#3a1a1a;color:#f87171;display:block!important}
@@ -5473,18 +5514,52 @@ h1{font-size:1.3rem;margin-bottom:6px}
 {% if not active %}
 <div id="status" class="inactive">⏸️ Kein Captcha angefordert.<br>Die Bridge wartet gerade nicht auf eine Lösung.</div>
 {% else %}
-<div class="h-captcha" data-sitekey="{{ sitekey }}" data-callback="onCaptchaSolved" data-theme="dark"></div>
-<div id="status"></div>
+<div class="h-captcha" id="captchaMount"></div>
+<div id="status" class="waiting">⏳ Captcha wird geladen…</div>
 {% endif %}
 </div>
 <script>
+let captchaRendered = false;
+
+function showCaptchaError(message) {
+  const st = document.getElementById('status');
+  if (!st) return;
+  st.className = 'err';
+  st.innerHTML = '❌ ' + message + '<br><small>Bitte im externen Browser öffnen und Inhaltsblocker für hcaptcha.com deaktivieren.</small>';
+}
+
+function renderCaptcha() {
+  {% if active %}
+  const mount = document.getElementById('captchaMount');
+  if (!mount || !window.hcaptcha || captchaRendered) return;
+  try {
+    window.hcaptcha.render(mount, {
+      sitekey: '{{ sitekey }}',
+      theme: 'dark',
+      size: 'compact',
+      callback: onCaptchaSolved,
+      'error-callback': function(code) { showCaptchaError('hCaptcha-Fehler: ' + code); },
+      'expired-callback': function() { showCaptchaError('Captcha abgelaufen – Seite bitte neu laden.'); },
+      'chalexpired-callback': function() { showCaptchaError('Aufgabe abgelaufen – Seite bitte neu laden.'); }
+    });
+    captchaRendered = true;
+    const st = document.getElementById('status');
+    st.className = '';
+    st.textContent = '';
+  } catch (e) {
+    showCaptchaError('Widget konnte nicht angezeigt werden: ' + e.message);
+  }
+  {% endif %}
+}
+
 function onCaptchaSolved(token) {
   const st = document.getElementById('status');
   st.className = 'waiting';
   st.textContent = '⏳ Token wird gesendet...';
-  fetch('{{ bridge_url }}/captcha-callback', {
+  fetch('/captcha-callback', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
+    cache: 'no-store',
     body: JSON.stringify({token: token})
   })
   .then(r => r.json())
@@ -5511,7 +5586,7 @@ function requestNewCaptcha() {
   st.className = 'waiting';
   st.textContent = '⏳ Cookie-Refresh wird gestartet… Captcha erscheint gleich.';
 
-  fetch('{{ bridge_url }}/captcha-request-new', {method: 'POST'})
+  fetch('/captcha-request-new', {method: 'POST', cache: 'no-store'})
   .then(r => r.json())
   .then(d => {
     if (d.ok) {
@@ -5537,12 +5612,14 @@ function pollForCaptcha() {
   const maxAttempts = 60; // max 60s
   const iv = setInterval(() => {
     attempts++;
-    fetch('{{ bridge_url }}/captcha-status')
+    fetch('/captcha-status?ts=' + Date.now(), {cache: 'no-store'})
     .then(r => r.json())
     .then(d => {
       if (d.active) {
         clearInterval(iv);
-        window.location.reload();
+        const url = new URL(window.location.href);
+        url.searchParams.set('request', Date.now().toString());
+        window.location.replace(url.toString());
       } else if (attempts >= maxAttempts) {
         clearInterval(iv);
         const st = document.getElementById('status');
@@ -5556,7 +5633,22 @@ function pollForCaptcha() {
     .catch(() => {});
   }, 1000);
 }
-</script></body></html>""", sitekey=sitekey, bridge_url=bridge_url, active=active)
+
+{% if active %}
+setTimeout(function() {
+  if (!document.querySelector('#captchaMount iframe')) {
+    showCaptchaError('hCaptcha wurde nicht geladen.');
+  }
+}, 12000);
+{% endif %}
+</script>
+{% if active %}<script src="{{ captcha_api_url }}" async defer onerror="showCaptchaError('hCaptcha-Netzwerkdatei blockiert.')"></script>{% endif %}
+</body></html>""", sitekey=sitekey, captcha_api_url=captcha_api_url, active=active)
+    response = Response(html, content_type="text/html; charset=UTF-8")
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.route("/captcha-callback", methods=["POST"])
@@ -5609,10 +5701,12 @@ def captcha_request_new():
 @app.route("/captcha-status")
 def captcha_status():
     """Gibt den aktuellen Captcha-Status zurück."""
-    return jsonify({
+    response = jsonify({
         "active": _captcha_request_active,
         "waiting": _captcha_request_active and not _pending_captcha_event.is_set(),
     })
+    response.headers["Cache-Control"] = "no-store, max-age=0"
+    return response
 
 
 # ============================================================
