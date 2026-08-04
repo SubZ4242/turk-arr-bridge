@@ -13,11 +13,16 @@ class CaptchaPageCompatibilityTests(unittest.TestCase):
         self.old_active = bridge._captcha_request_active
         self.old_sitekey = bridge._pending_captcha_sitekey
         self.old_host = bridge._pending_captcha_host
+        self.old_external_url = bridge._config.get("bridge_external_url")
 
     def tearDown(self):
         bridge._captcha_request_active = self.old_active
         bridge._pending_captcha_sitekey = self.old_sitekey
         bridge._pending_captcha_host = self.old_host
+        if self.old_external_url is None:
+            bridge._config.pop("bridge_external_url", None)
+        else:
+            bridge._config["bridge_external_url"] = self.old_external_url
 
     def test_extracts_current_sitekey_from_tracker_html(self):
         html = (
@@ -55,6 +60,56 @@ class CaptchaPageCompatibilityTests(unittest.TestCase):
         with patch.object(bridge, "refresh_title_cache"):
             response = bridge.app.test_client().get("/captcha-status")
         self.assertIn("no-store", response.headers["Cache-Control"])
+
+    def test_telegram_message_contains_internal_and_optional_external_links(self):
+        bridge._config["bridge_external_url"] = "http://100.79.56.23:9696/"
+        with patch.object(
+            bridge, "_get_internal_bridge_url", return_value="http://192.168.1.50:9696"
+        ), patch.object(
+            bridge, "_send_telegram_alert"
+        ) as send, patch.object(
+            bridge._pending_captcha_event, "wait", return_value=False
+        ), patch.object(
+            bridge.time, "time", return_value=1234567890
+        ):
+            bridge._request_manual_captcha("https://turktorrent.us", timeout_minutes=1)
+
+        first_message = send.call_args_list[0].args[0]
+        self.assertIn("Intern / LAN öffnen", first_message)
+        self.assertIn(
+            "http://192.168.1.50:9696/captcha?request=1234567890",
+            first_message,
+        )
+        self.assertIn("Extern / Tailscale öffnen", first_message)
+        self.assertIn(
+            "http://100.79.56.23:9696/captcha?request=1234567890",
+            first_message,
+        )
+
+    def test_invalid_external_url_is_ignored(self):
+        self.assertEqual(bridge._normalize_bridge_url("javascript:alert(1)"), "")
+        self.assertEqual(bridge._normalize_bridge_url("100.79.56.23:9696"), "")
+        self.assertEqual(
+            bridge._normalize_bridge_url("https://nas.example.ts.net/"),
+            "https://nas.example.ts.net",
+        )
+
+    def test_installations_without_external_url_keep_single_lan_link(self):
+        bridge._config["bridge_external_url"] = ""
+        with patch.object(
+            bridge, "_get_internal_bridge_url", return_value="http://192.168.1.50:9696"
+        ), patch.object(
+            bridge, "_send_telegram_alert"
+        ) as send, patch.object(
+            bridge._pending_captcha_event, "wait", return_value=False
+        ), patch.object(
+            bridge.time, "time", return_value=1234567890
+        ):
+            bridge._request_manual_captcha("https://turktorrent.us", timeout_minutes=1)
+
+        first_message = send.call_args_list[0].args[0]
+        self.assertIn("Intern / LAN öffnen", first_message)
+        self.assertNotIn("Extern / Tailscale öffnen", first_message)
 
     def test_forced_captcha_test_does_not_stop_at_valid_cookie(self):
         saved = {

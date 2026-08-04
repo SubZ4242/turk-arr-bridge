@@ -57,7 +57,7 @@ The bridge:
 - 📦 **BoxSet fallback** — auto-downloads complete series BoxSets via qBittorrent when no season pack exists
 - 🔄 **Version-robust qBittorrent WebAPI** — supports legacy responses as well as qBittorrent 5.2+ (`204` responses and port-specific session cookies)
 - 🩺 **Sonarr/Radarr indexer self-healing** — safely clears persistent ARR backoff after Jackett/tracker recovery
-- 📱 **Tailscale-safe Telegram captcha** — cache-proof links, tracker-host rendering, and same-origin callbacks
+- 📱 **Tailscale-safe Telegram captcha** — optional external URL plus separate LAN/external links in each bot message
 - 🎬 **Quality prioritization** — 2160p > 1080p > 720p > SD, H.265 bonus
 - ✏️ **Title rewrite** — rewrites torrent titles in XML so Radarr/Sonarr can match Turkish titles
 - 📨 **Telegram notifications** — for automatic BoxSet downloads
@@ -188,7 +188,7 @@ All settings can be configured via:
 | `LOG_LEVEL` | Log verbosity | `INFO` |
 | `ARR_INDEXER_AUTO_HEAL` | Re-test this bridge's ARR indexers after verified tracker recovery | `true` |
 | `ARR_INDEXER_HEAL_INTERVAL_MINUTES` | Self-healing check interval (minimum 5 minutes) | `15` |
-| `BRIDGE_EXTERNAL_URL` | Bridge URL reachable from the phone; use a Tailscale HTTPS/MagicDNS URL when applicable | `https://nas.example.ts.net` |
+| `BRIDGE_EXTERNAL_URL` | Optional URL reachable externally; when set, Telegram sends both automatic LAN and external links | `https://nas.example.ts.net` |
 
 ---
 

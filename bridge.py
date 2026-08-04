@@ -16,6 +16,7 @@ import time
 import logging
 import hashlib
 import json
+import html as html_lib
 import urllib.parse
 import threading
 from typing import Optional
@@ -210,6 +211,39 @@ def _extract_hcaptcha_sitekey(page_html: str) -> str:
     return ""
 
 
+def _normalize_bridge_url(value: str) -> str:
+    """Akzeptiert nur vollständige HTTP(S)-URLs für Telegram-Captcha-Links."""
+    value = str(value or "").strip().rstrip("/")
+    if not value:
+        return ""
+    try:
+        parsed = urllib.parse.urlparse(value)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            return ""
+        if parsed.username or parsed.password:
+            return ""
+        # Ein optionaler Reverse-Proxy-Pfad bleibt erhalten.
+        base_path = parsed.path.rstrip("/")
+        return urllib.parse.urlunparse((
+            parsed.scheme, parsed.netloc, base_path, "", "", ""
+        ))
+    except (TypeError, ValueError):
+        return ""
+
+
+def _get_internal_bridge_url() -> str:
+    """Ermittelt die intern/LAN erreichbare Bridge-Adresse automatisch."""
+    import socket as _sock
+    try:
+        sock = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        local_ip = sock.getsockname()[0]
+        sock.close()
+    except Exception:
+        local_ip = "127.0.0.1"
+    return f"http://{local_ip}:{_config.get('bridge_port', 9696)}"
+
+
 def _request_manual_captcha(site_url: str, timeout_minutes: int = 10,
                             sitekey: str = "") -> dict:
     """
@@ -228,32 +262,39 @@ def _request_manual_captcha(site_url: str, timeout_minutes: int = 10,
     _captcha_request_active = True
 
     try:
-        # Bridge-URL ermitteln (für den Telegram-Link)
-        bridge_host = _config.get("bridge_external_url", "").rstrip("/")
-        if not bridge_host:
-            # Fallback: lokale IP + Port
-            # Fallback: versuche eigene IP zu ermitteln
-            import socket as _sock
-            try:
-                _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
-                _s.connect(("8.8.8.8", 80))
-                _local_ip = _s.getsockname()[0]
-                _s.close()
-            except Exception:
-                _local_ip = "127.0.0.1"
-            bridge_host = f"http://{_local_ip}:{_config.get('bridge_port', 9696)}"
-
         # Telegram-/WebView-Caches dürfen keine alte inaktive Captcha-Seite
         # wiederverwenden. Jede Anforderung erhält deshalb eine eindeutige URL.
-        captcha_url = f"{bridge_host}/captcha?request={int(time.time())}"
-        print(f"[CAPTCHA] hCaptcha-Lösung benötigt! Link: {captcha_url}")
+        request_id = int(time.time())
+        internal_host = _get_internal_bridge_url().rstrip("/")
+        external_host = _normalize_bridge_url(
+            _config.get("bridge_external_url", "")
+        )
+        internal_url = f"{internal_host}/captcha?request={request_id}"
+        external_url = (
+            f"{external_host}/captcha?request={request_id}"
+            if external_host and external_host != internal_host else ""
+        )
+        print(f"[CAPTCHA] Interner Link: {internal_url}")
+        if external_url:
+            print(f"[CAPTCHA] Externer Link: {external_url}")
+
+        link_lines = (
+            f"🏠 <a href=\"{html_lib.escape(internal_url, quote=True)}\">"
+            f"Intern / LAN öffnen</a>"
+        )
+        if external_url:
+            link_lines += (
+                f"\n\n🌍 <a href=\"{html_lib.escape(external_url, quote=True)}\">"
+                f"Extern / Tailscale öffnen</a>"
+            )
 
         # Telegram-Nachricht senden
         _send_telegram_alert(
             f"🔐 <b>hCaptcha-Lösung benötigt!</b>\n\n"
             f"TurkTorrent Session abgelaufen.\n"
             f"Bitte Captcha lösen (max. {timeout_minutes} Min):\n\n"
-            f"👉 <a href=\"{captcha_url}\">Captcha jetzt lösen</a>"
+            f"Wähle den für dein aktuelles Netzwerk passenden Link:\n\n"
+            f"{link_lines}"
         )
 
         # Warte auf Token (max. timeout_minutes)
@@ -3427,6 +3468,18 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 </div>
 </div>
 
+<div class="card"><h2>🔐 Telegram-Captcha-Zugriff</h2>
+<div class="hint" style="margin-bottom:12px">Der Bot sendet immer den automatisch erkannten internen Link. Wenn du zusätzlich eine externe URL einträgst, erscheinen in derselben Nachricht zwei Links zur Auswahl.</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+  <div class="field"><label>🏠 Interne/LAN-URL (automatisch)</label><input id="captcha_internal_url" readonly placeholder="Wird automatisch erkannt"><div class="hint">Für Geräte im Heimnetz; muss nicht konfiguriert werden.</div></div>
+  <div class="field"><label>🌍 Externe URL (optional)</label><input id="cfg_bridge_external_url" placeholder="http://100.x.x.x:9696 oder https://nas.example.ts.net"><div class="hint">Zum Beispiel Tailscale, VPN oder Reverse Proxy. Ohne Eintrag bleibt alles wie bisher.</div></div>
+</div>
+<div class="btn-row" style="justify-content:flex-end">
+  <button class="btn btn-primary" onclick="saveCaptchaLinks()">💾 Captcha-Links speichern</button>
+</div>
+<div id="captchaLinksPreview" style="margin-top:10px;padding:10px 14px;border-radius:8px;background:var(--bg);border:1px solid var(--border);font-size:.82rem;color:var(--text2)">Links werden geladen…</div>
+</div>
+
 </div>
 
 <!-- VERBINDUNGEN (2x2 Grid) -->
@@ -3475,7 +3528,6 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
 <div>
 <div class="field"><label>🤖 FlareSolverr URL</label><input id="cfg_flaresolverr_url" placeholder="http://localhost:8191"></div>
-<div class="field"><label>🔗 Captcha-/Tailscale-URL</label><input id="cfg_bridge_external_url" placeholder="https://dein-nas.tailnet-name.ts.net"><div class="hint">Optional: die vom Handy erreichbare vollständige Bridge-URL. Sie wird für den Telegram-Captcha-Link verwendet.</div></div>
 <div class="field"><label>👤 TurkTorrent Benutzername</label><input id="cfg_turktorrent_username" placeholder="dein TurkTorrent Username"></div>
 <div class="field"><label>🔑 TurkTorrent Passwort</label><input id="cfg_turktorrent_password" type="password" placeholder="dein TurkTorrent Passwort"></div>
 </div>
@@ -3881,7 +3933,45 @@ async function loadDashboard() {
   try {
     testAllConnections();
     loadDashboardIndexerStatus();
+    loadCaptchaLinks();
   } catch(e) { console.error(e); }
+}
+
+async function loadCaptchaLinks() {
+  const preview = document.getElementById('captchaLinksPreview');
+  try {
+    const r = await api('/gui/api/captcha-links');
+    const internalInput = document.getElementById('captcha_internal_url');
+    const externalInput = document.getElementById('cfg_bridge_external_url');
+    if (internalInput) internalInput.value = r.internal_url || '';
+    if (externalInput) externalInput.value = r.external_url || '';
+    if (preview) {
+      let html = '<strong>Telegram sendet:</strong><br>🏠 Intern: ' + esc(r.internal_url || '–');
+      if (r.external_url) html += '<br>🌍 Extern: ' + esc(r.external_url);
+      else html += '<br><span style="opacity:.65">Kein externer Link konfiguriert.</span>';
+      preview.innerHTML = html;
+    }
+  } catch(e) {
+    if (preview) preview.textContent = '❌ Captcha-Links konnten nicht geladen werden';
+  }
+}
+
+async function saveCaptchaLinks() {
+  const input = document.getElementById('cfg_bridge_external_url');
+  try {
+    const r = await api('/gui/api/captcha-links', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({external_url: (input?.value || '').trim()})
+    });
+    if (!r.ok) throw new Error(r.error || 'Speichern fehlgeschlagen');
+    toast(r.telegram_link_count === 2
+      ? '✓ Interner und externer Captcha-Link gespeichert'
+      : '✓ Interner Captcha-Link aktiv', 'ok');
+    loadCaptchaLinks();
+  } catch(e) {
+    toast('❌ ' + e.message, 'err');
+  }
 }
 
 async function testAllConnections() {
@@ -5279,6 +5369,31 @@ def gui_indexer_status():
         "interval_minutes": interval,
         "flaresolverr_ok": flaresolverr_ok,
         "flaresolverr_url": flaresolverr_url,
+    })
+
+
+@app.route("/gui/api/captcha-links", methods=["GET", "POST"])
+def gui_captcha_links():
+    """Liest/speichert den optionalen externen Link für Telegram-Captchas."""
+    if request.method == "POST":
+        data = request.json or {}
+        raw_external = str(data.get("external_url", "") or "").strip()
+        external = _normalize_bridge_url(raw_external)
+        if raw_external and not external:
+            return jsonify({
+                "ok": False,
+                "error": "Bitte eine vollständige HTTP- oder HTTPS-URL eingeben",
+            }), 400
+        _config["bridge_external_url"] = external
+        _save_config(_config)
+
+    internal = _get_internal_bridge_url()
+    external = _normalize_bridge_url(_config.get("bridge_external_url", ""))
+    return jsonify({
+        "ok": True,
+        "internal_url": internal,
+        "external_url": external,
+        "telegram_link_count": 2 if external and external != internal else 1,
     })
 
 
