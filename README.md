@@ -56,6 +56,7 @@ The bridge:
 - 🧠 **Self-learning** — learns new titles from TVDB lookups and persists them
 - 📦 **BoxSet fallback** — auto-downloads complete series BoxSets via qBittorrent when no season pack exists
 - 🔄 **Version-robust qBittorrent WebAPI** — supports legacy responses as well as qBittorrent 5.2+ (`204` responses and port-specific session cookies)
+- 🩺 **Sonarr/Radarr indexer self-healing** — safely clears persistent ARR backoff after Jackett/tracker recovery
 - 🎬 **Quality prioritization** — 2160p > 1080p > 720p > SD, H.265 bonus
 - ✏️ **Title rewrite** — rewrites torrent titles in XML so Radarr/Sonarr can match Turkish titles
 - 📨 **Telegram notifications** — for automatic BoxSet downloads
@@ -184,6 +185,8 @@ All settings can be configured via:
 | `BRIDGE_PORT` | Bridge port | `9696` |
 | `CACHE_TTL_SECONDS` | Cache duration in seconds | `300` |
 | `LOG_LEVEL` | Log verbosity | `INFO` |
+| `ARR_INDEXER_AUTO_HEAL` | Re-test this bridge's ARR indexers after verified tracker recovery | `true` |
+| `ARR_INDEXER_HEAL_INTERVAL_MINUTES` | Self-healing check interval (minimum 5 minutes) | `15` |
 
 ---
 
@@ -265,4 +268,3 @@ MIT License — see [LICENSE](LICENSE)
 *Built for the Turkish home cinema setup. Contributions welcome!* 🇹🇷
 
 ---
-

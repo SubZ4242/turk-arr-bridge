@@ -72,6 +72,8 @@ _DEFAULT_CONFIG = {
     "turktorrent_current_cookie": "",
     "bridge_external_url": "",
     "flaresolverr_url": "",
+    "arr_indexer_auto_heal": True,
+    "arr_indexer_heal_interval_minutes": 15,
 }
 
 
@@ -94,12 +96,19 @@ def _load_config() -> dict:
         "TELEGRAM_CHAT_ID": "telegram_chat_id",
         "BRIDGE_PORT": "bridge_port", "CACHE_TTL_SECONDS": "cache_ttl_seconds",
         "LOG_LEVEL": "log_level",
+        "ARR_INDEXER_AUTO_HEAL": "arr_indexer_auto_heal",
+        "ARR_INDEXER_HEAL_INTERVAL_MINUTES": "arr_indexer_heal_interval_minutes",
     }
     for env_key, cfg_key in env_map.items():
         val = os.environ.get(env_key)
         if val:
-            if cfg_key in ("bridge_port", "cache_ttl_seconds"):
+            if cfg_key in (
+                "bridge_port", "cache_ttl_seconds",
+                "arr_indexer_heal_interval_minutes",
+            ):
                 cfg[cfg_key] = int(val)
+            elif cfg_key == "arr_indexer_auto_heal":
+                cfg[cfg_key] = str(val).strip().lower() in ("1", "true", "yes", "on")
             else:
                 cfg[cfg_key] = val
     # JSON-Datei hat höchste Priorität (GUI-Änderungen überschreiben Env-Vars)
@@ -871,6 +880,9 @@ def _do_cookie_refresh():
     _save_config(_config)
     print(f"[COOKIE] {msg}")
     _send_telegram_alert(f"✅ <b>Cookie erfolgreich aktualisiert!</b>\nJackett wurde mit neuen TurkTorrent-Cookies versorgt.")
+    # ARR kann den Indexer nach dem vorherigen Loginfehler weiterhin sperren.
+    # Nach erfolgreicher Reparatur sofort eine abgesicherte Reaktivierung planen.
+    _request_arr_indexer_heal()
     return {"ok": True, "error": ""}
 
 
@@ -1217,6 +1229,244 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S"
 )
 logger = logging.getLogger("TurkARRBridge")
+
+# ============================================================
+# ARR Indexer Self-Healing
+# ============================================================
+
+_arr_heal_thread: Optional[threading.Thread] = None
+_arr_heal_event = threading.Event()
+_arr_heal_lock = threading.Lock()
+_arr_heal_status_lock = threading.Lock()
+_arr_heal_status = {
+    "enabled": bool(_config.get("arr_indexer_auto_heal", True)),
+    "last_check": "",
+    "upstream_ok": None,
+    "tested": 0,
+    "recovered": 0,
+    "error": "",
+}
+
+
+def _arr_api_headers(api_key: str) -> dict:
+    """Standard-Header für Sonarr/Radarr v3, ohne Key in URLs/Logs."""
+    return {"X-Api-Key": api_key, "Accept": "application/json"}
+
+
+def _arr_indexer_field(indexer: dict, name: str, default=""):
+    """Liest ein Feld aus dem von Sonarr/Radarr gelieferten Indexer-Modell."""
+    for field in indexer.get("fields", []):
+        if str(field.get("name", "")).lower() == name.lower():
+            return field.get("value", default)
+    return default
+
+
+def _is_this_bridge_indexer(indexer: dict) -> bool:
+    """Erkennt ausschließlich Torznab-Indexer, die auf diese Bridge zeigen."""
+    implementation = " ".join(
+        str(indexer.get(key, ""))
+        for key in ("implementation", "implementationName", "configContract")
+    ).lower()
+    if "torznab" not in implementation:
+        return False
+
+    base_url = str(_arr_indexer_field(indexer, "baseUrl", "") or "").strip()
+    if not base_url:
+        return False
+    try:
+        parsed = urllib.parse.urlparse(base_url)
+        effective_port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        bridge_port = int(_config.get("bridge_port", BRIDGE_PORT) or BRIDGE_PORT)
+    except (TypeError, ValueError):
+        return False
+
+    external_url = str(_config.get("bridge_external_url", "") or "").strip()
+    if external_url:
+        try:
+            external = urllib.parse.urlparse(external_url)
+            if parsed.netloc.lower() == external.netloc.lower():
+                return True
+        except ValueError:
+            pass
+
+    # Der Host kann je nach Docker-/NAS-Netz anders heißen. Port plus der
+    # Bridge-spezifische Torznab-Pfad sind stabiler als ein Hostvergleich.
+    api_path = str(_arr_indexer_field(indexer, "apiPath", "") or "").lower()
+    path = (parsed.path.rstrip("/") + "/" + api_path.lstrip("/")).lower()
+    return effective_port == bridge_port and "torznab" in path
+
+
+def _probe_upstream_torznab() -> tuple[bool, str]:
+    """Echte No-Match-Suche: prüft Jackett, Tracker-Login und Parser gemeinsam."""
+    if not UPSTREAM_TORZNAB_URL or not JACKETT_API_KEY:
+        return False, "Upstream-Torznab oder Jackett API-Key fehlt"
+    try:
+        response = requests.get(
+            UPSTREAM_TORZNAB_URL,
+            params={
+                "apikey": JACKETT_API_KEY,
+                "t": "search",
+                "q": "TurkARRBridgeHealthProbeNoMatch",
+                "limit": 1,
+            },
+            timeout=45,
+        )
+        if not response.ok:
+            return False, f"Jackett HTTP {response.status_code}"
+        try:
+            root = etree.fromstring(response.content)
+            if etree.QName(root).localname.lower() == "error":
+                return False, root.get("description") or "Torznab-Fehler"
+        except (etree.XMLSyntaxError, ValueError):
+            return False, "Jackett lieferte kein gültiges Torznab-XML"
+        return True, ""
+    except requests.RequestException as exc:
+        return False, f"Jackett nicht erreichbar: {type(exc).__name__}"
+
+
+def _arr_has_indexer_warning(base_url: str, api_key: str) -> bool:
+    """Erkennt Sonarr/Radarr-Warnungen über gesperrte Indexer."""
+    try:
+        response = requests.get(
+            f"{base_url.rstrip('/')}/api/v3/health",
+            headers=_arr_api_headers(api_key),
+            timeout=10,
+        )
+        if not response.ok:
+            return False
+        for warning in response.json():
+            source = str(warning.get("source", "")).lower()
+            message = str(warning.get("message", "")).lower()
+            if "indexer" in source or "indexer" in message:
+                return True
+    except (requests.RequestException, ValueError, TypeError):
+        pass
+    return False
+
+
+def heal_arr_indexers() -> dict:
+    """Reaktiviert nur diese Bridge, nachdem der Tracker real verifiziert wurde.
+
+    Sonarr und Radarr behalten Indexerfehler über Neustarts hinweg. Nach einer
+    Tracker-/Cookie-Reparatur fragen sie den inzwischen gesunden Indexer deshalb
+    oft weiterhin nicht ab. Ein erfolgreicher offizieller Indexer-Test setzt
+    genau diesen Fehlerzustand zurück, ohne Konfigurationen zu verändern.
+    """
+    enabled = bool(_config.get("arr_indexer_auto_heal", True))
+    result = {
+        "enabled": enabled,
+        "last_check": datetime.now().isoformat(timespec="seconds"),
+        "upstream_ok": False,
+        "tested": 0,
+        "recovered": 0,
+        "error": "",
+    }
+    if not enabled:
+        with _arr_heal_status_lock:
+            _arr_heal_status.update(result)
+        return result
+
+    if not _arr_heal_lock.acquire(blocking=False):
+        result["error"] = "Prüfung läuft bereits"
+        return result
+
+    try:
+        upstream_ok, upstream_error = _probe_upstream_torznab()
+        result["upstream_ok"] = upstream_ok
+        if not upstream_ok:
+            result["error"] = upstream_error
+            logger.warning(f"[ARR-HEAL] Kein Reset: {upstream_error}")
+            return result
+
+        service_errors = []
+        for service_name, base_url, api_key in (
+            ("Sonarr", SONARR_URL, SONARR_API_KEY),
+            ("Radarr", RADARR_URL, RADARR_API_KEY),
+        ):
+            if not base_url or not api_key:
+                continue
+            headers = _arr_api_headers(api_key)
+            had_warning = _arr_has_indexer_warning(base_url, api_key)
+            try:
+                response = requests.get(
+                    f"{base_url.rstrip('/')}/api/v3/indexer",
+                    headers=headers,
+                    timeout=15,
+                )
+                response.raise_for_status()
+                indexers = response.json()
+            except (requests.RequestException, ValueError, TypeError) as exc:
+                service_errors.append(f"{service_name}: {type(exc).__name__}")
+                continue
+
+            for indexer in indexers:
+                if not _is_this_bridge_indexer(indexer):
+                    continue
+                if not any(indexer.get(flag, False) for flag in (
+                    "enableRss", "enableAutomaticSearch", "enableInteractiveSearch"
+                )):
+                    continue
+                try:
+                    test_response = requests.post(
+                        f"{base_url.rstrip('/')}/api/v3/indexer/test",
+                        headers={**headers, "Content-Type": "application/json"},
+                        json=indexer,
+                        timeout=60,
+                    )
+                    result["tested"] += 1
+                    if test_response.ok and had_warning:
+                        result["recovered"] += 1
+                        logger.info(
+                            f"[ARR-HEAL] {service_name}-Indexer "
+                            f"'{indexer.get('name', indexer.get('id', '?'))}' reaktiviert"
+                        )
+                    elif not test_response.ok:
+                        service_errors.append(
+                            f"{service_name} Test HTTP {test_response.status_code}"
+                        )
+                except requests.RequestException as exc:
+                    service_errors.append(f"{service_name} Test: {type(exc).__name__}")
+
+        result["error"] = "; ".join(service_errors)
+        if result["tested"] == 0 and not result["error"]:
+            result["error"] = "Kein Bridge-Torznab-Indexer in Sonarr/Radarr gefunden"
+        return result
+    finally:
+        with _arr_heal_status_lock:
+            _arr_heal_status.update(result)
+        _arr_heal_lock.release()
+
+
+def _arr_heal_loop():
+    """Prüft beim Start und danach periodisch auf persistente ARR-Sperren."""
+    if _arr_heal_event.wait(20):
+        _arr_heal_event.clear()
+    while True:
+        try:
+            heal_arr_indexers()
+        except Exception as exc:
+            logger.error(f"[ARR-HEAL] Unerwarteter Fehler: {exc}")
+        try:
+            minutes = max(
+                5, int(_config.get("arr_indexer_heal_interval_minutes", 15) or 15)
+            )
+        except (TypeError, ValueError):
+            minutes = 15
+        _arr_heal_event.wait(minutes * 60)
+        _arr_heal_event.clear()
+
+
+def _start_arr_heal_thread():
+    global _arr_heal_thread
+    if _arr_heal_thread is None or not _arr_heal_thread.is_alive():
+        _arr_heal_thread = threading.Thread(target=_arr_heal_loop, daemon=True)
+        _arr_heal_thread.start()
+        logger.info("[ARR-HEAL] Auto-Healing gestartet")
+
+
+def _request_arr_indexer_heal():
+    """Weckt den Healer direkt nach einer erfolgreichen Tracker-Reparatur."""
+    _arr_heal_event.set()
 
 # ============================================================
 # Türkische Zeichen Mapping
@@ -2170,6 +2420,9 @@ result_cache = ResultCache(ttl_seconds=CACHE_TTL_SECONDS)
 # Cookie-Refresh Thread direkt starten (auch unter gunicorn)
 _start_cookie_refresh_thread()
 
+# Sonarr/Radarr-Backoff nach behobenen Trackerfehlern automatisch entfernen.
+_start_arr_heal_thread()
+
 
 @app.before_request
 def ensure_title_cache():
@@ -2766,6 +3019,8 @@ def torznab_proxy():
 def health():
     """Health-Check Endpoint."""
     stats = title_cache.stats()
+    with _arr_heal_status_lock:
+        arr_heal = dict(_arr_heal_status)
     return {
         "status": "ok",
         "bridge": "TurkARRBridge",
@@ -2774,6 +3029,7 @@ def health():
         "upstream": UPSTREAM_TORZNAB_URL,
         "sonarr": SONARR_URL,
         "radarr": RADARR_URL,
+        "arr_indexer_auto_heal": arr_heal,
     }
 
 
@@ -4898,7 +5154,10 @@ def gui_save_config():
             # gui_pass nie mit leerem Wert überschreiben (Passwortfeld wird leer gesendet)
             if k == "gui_pass" and str(val).strip() == "":
                 continue
-            if k in ("bridge_port", "cache_ttl_seconds"):
+            if k in (
+                "bridge_port", "cache_ttl_seconds",
+                "arr_indexer_heal_interval_minutes",
+            ):
                 try:
                     val = int(val)
                 except (ValueError, TypeError):
@@ -4934,6 +5193,7 @@ def gui_save_config():
     title_cache._last_refresh = None  # Force refresh
     logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
     logger.info(f"Konfiguration über GUI aktualisiert")
+    _request_arr_indexer_heal()
     return jsonify({"ok": True})
 
 
@@ -5109,7 +5369,10 @@ def gui_restore():
         for k in _DEFAULT_CONFIG:
             if k in uploaded and uploaded[k] is not None:
                 val = uploaded[k]
-                if k in ("bridge_port", "cache_ttl_seconds"):
+                if k in (
+                    "bridge_port", "cache_ttl_seconds",
+                    "arr_indexer_heal_interval_minutes",
+                ):
                     try:
                         val = int(val)
                     except (ValueError, TypeError):
@@ -5145,6 +5408,7 @@ def gui_restore():
         title_cache._last_refresh = None
         logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
         logger.info("Konfiguration über Restore wiederhergestellt")
+        _request_arr_indexer_heal()
         return jsonify({"ok": True})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)[:200]}), 500
