@@ -36,6 +36,16 @@ class CaptchaPageCompatibilityTests(unittest.TestCase):
         )
         self.assertEqual(bridge._extract_hcaptcha_sitekey("<html></html>"), "")
 
+    def test_captcha_link_settings_are_in_telegram_panel_not_dashboard(self):
+        html = bridge.GUI_HTML
+        dashboard_start = html.index('id="panel-dashboard"')
+        telegram_start = html.index('id="panel-notif-telegram"')
+        captcha_settings = html.index("Telegram-Captcha-Zugriff")
+        next_panel = html.index('id="panel-search"')
+
+        self.assertFalse(dashboard_start < captcha_settings < telegram_start)
+        self.assertTrue(telegram_start < captcha_settings < next_panel)
+
     def test_active_page_uses_tracker_host_and_same_origin_callbacks(self):
         bridge._captcha_request_active = True
         bridge._pending_captcha_sitekey = "dynamic-sitekey_12345678901234567890"

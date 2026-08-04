@@ -3468,18 +3468,6 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 </div>
 </div>
 
-<div class="card"><h2>🔐 Telegram-Captcha-Zugriff</h2>
-<div class="hint" style="margin-bottom:12px">Der Bot sendet immer den automatisch erkannten internen Link. Wenn du zusätzlich eine externe URL einträgst, erscheinen in derselben Nachricht zwei Links zur Auswahl.</div>
-<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
-  <div class="field"><label>🏠 Interne/LAN-URL (automatisch)</label><input id="captcha_internal_url" readonly placeholder="Wird automatisch erkannt"><div class="hint">Für Geräte im Heimnetz; muss nicht konfiguriert werden.</div></div>
-  <div class="field"><label>🌍 Externe URL (optional)</label><input id="cfg_bridge_external_url" placeholder="http://100.x.x.x:9696 oder https://nas.example.ts.net"><div class="hint">Zum Beispiel Tailscale, VPN oder Reverse Proxy. Ohne Eintrag bleibt alles wie bisher.</div></div>
-</div>
-<div class="btn-row" style="justify-content:flex-end">
-  <button class="btn btn-primary" onclick="saveCaptchaLinks()">💾 Captcha-Links speichern</button>
-</div>
-<div id="captchaLinksPreview" style="margin-top:10px;padding:10px 14px;border-radius:8px;background:var(--bg);border:1px solid var(--border);font-size:.82rem;color:var(--text2)">Links werden geladen…</div>
-</div>
-
 </div>
 
 <!-- VERBINDUNGEN (2x2 Grid) -->
@@ -3644,6 +3632,18 @@ body{font-family:'Segoe UI',system-ui,-apple-system,sans-serif;background:var(--
 <div class="field"><label data-i18n="tg_chat">Chat ID</label><input id="cfg_telegram_chat_id" placeholder="-1001234567890"><div class="hint" data-i18n="tg_chat_hint">Chat-ID der Telegram-<b>Gruppe</b> oder des <b>Kanals</b>. Negative Zahl = Gruppe. Über <b>@userinfobot</b> ermitteln.</div></div>
 </div>
 <div class="btn-row"><button class="btn btn-primary" onclick="saveConfig()">💾 <span data-i18n="btn_save">Speichern</span></button><button class="btn btn-outline" onclick="testTelegram()">📨 <span data-i18n="tg_test">Test senden</span></button></div>
+</div>
+
+<div class="card"><h2>🔐 Telegram-Captcha-Zugriff</h2>
+<div class="hint" style="margin-bottom:12px">Der Bot sendet immer den automatisch erkannten internen Link. Wenn du zusätzlich eine externe URL einträgst, erscheinen in derselben Nachricht zwei Links zur Auswahl.</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:14px">
+  <div class="field"><label>🏠 Interne/LAN-URL (automatisch)</label><input id="captcha_internal_url" readonly placeholder="Wird automatisch erkannt"><div class="hint">Für Geräte im Heimnetz; muss nicht konfiguriert werden.</div></div>
+  <div class="field"><label>🌍 Externe URL (optional)</label><input id="cfg_bridge_external_url" placeholder="http://100.x.x.x:9696 oder https://nas.example.ts.net"><div class="hint">Zum Beispiel Tailscale, VPN oder Reverse Proxy. Ohne Eintrag bleibt alles wie bisher.</div></div>
+</div>
+<div class="btn-row" style="justify-content:flex-end">
+  <button class="btn btn-primary" onclick="saveCaptchaLinks()">💾 Captcha-Links speichern</button>
+</div>
+<div id="captchaLinksPreview" style="margin-top:10px;padding:10px 14px;border-radius:8px;background:var(--bg);border:1px solid var(--border);font-size:.82rem;color:var(--text2)">Links werden geladen…</div>
 </div>
 </div>
 
@@ -3810,6 +3810,7 @@ function navTo(panel, el) {
   if (panel === 'dashboard') loadDashboard();
   if (panel === 'mappings') loadMappings();
   if (panel === 'connections' || panel === 'settings-system' || panel === 'settings-tuning' || panel === 'notif-telegram' || panel === 'indexer') loadConfig();
+  if (panel === 'notif-telegram') loadCaptchaLinks();
   if (panel === 'connections') applyToolIcons();
   if (panel === 'indexer') loadIndexerStatus();
   if (panel === 'logs') fetchLogs();
@@ -3933,7 +3934,6 @@ async function loadDashboard() {
   try {
     testAllConnections();
     loadDashboardIndexerStatus();
-    loadCaptchaLinks();
   } catch(e) { console.error(e); }
 }
 
