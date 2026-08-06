@@ -230,6 +230,65 @@ class TurkTorrentCookiePersistenceTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("bleibt erhalten", result["error"])
 
+    def test_negative_jackett_test_requests_new_login(self):
+        saved = {
+            key: bridge._config.get(key)
+            for key in ("jackett_url", "jackett_api_key", "jackett_admin_password")
+        }
+        bridge._config.update({
+            "jackett_url": "http://jackett.test:9117",
+            "jackett_api_key": "api-key",
+            "jackett_admin_password": "",
+        })
+        response = Mock(ok=True)
+        response.json.return_value = {
+            "Results": [],
+            "Indexers": [{"Error": "Login failed: selector did not match"}],
+        }
+        session = Mock()
+        session.get.return_value = response
+        try:
+            with patch.object(bridge, "_get_jackett_session", return_value=session), patch(
+                "bridge.requests.post"
+            ) as flaresolverr_post:
+                result = bridge._validate_turktorrent_cookie(
+                    "tsue_member=remember-me-token",
+                    "https://turktorrent.us",
+                    "http://flaresolverr:8191",
+                )
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    bridge._config.pop(key, None)
+                else:
+                    bridge._config[key] = value
+
+        self.assertFalse(result["ok"])
+        self.assertIn("Jackett-Test negativ", result["error"])
+        flaresolverr_post.assert_not_called()
+
+
+class TelegramCaptchaCleanupTests(unittest.TestCase):
+    def test_new_captcha_replaces_previous_request_and_persists_message_id(self):
+        old_id = bridge._config.get("telegram_last_captcha_message_id")
+        bridge._config["telegram_last_captcha_message_id"] = "100"
+        try:
+            with patch.object(bridge, "_delete_captcha_telegram_alert") as delete, patch.object(
+                bridge, "_send_telegram_alert", return_value=101
+            ) as send, patch.object(bridge, "_save_config") as save:
+                result = bridge._send_captcha_telegram_alert("new captcha")
+
+            delete.assert_called_once_with()
+            send.assert_called_once_with("new captcha")
+            save.assert_called_once()
+            self.assertEqual(result, 101)
+            self.assertEqual(bridge._config["telegram_last_captcha_message_id"], "101")
+        finally:
+            if old_id is None:
+                bridge._config.pop("telegram_last_captcha_message_id", None)
+            else:
+                bridge._config["telegram_last_captcha_message_id"] = old_id
+
 
 if __name__ == "__main__":
     unittest.main()

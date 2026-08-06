@@ -73,6 +73,7 @@ _DEFAULT_CONFIG = {
     "turktorrent_last_cookie_check": "",
     "turktorrent_cookie_status": "",
     "turktorrent_current_cookie": "",
+    "telegram_last_captcha_message_id": "",
     "bridge_external_url": "",
     "flaresolverr_url": "",
     "arr_indexer_auto_heal": True,
@@ -291,7 +292,7 @@ def _request_manual_captcha(site_url: str, timeout_minutes: int = 10,
             )
 
         # Telegram-Nachricht senden
-        _send_telegram_alert(
+        captcha_message_id = _send_captcha_telegram_alert(
             f"🔐 <b>hCaptcha-Lösung benötigt!</b>\n\n"
             f"TurkTorrent Session abgelaufen.\n"
             f"Bitte Captcha lösen (max. {timeout_minutes} Min):\n\n"
@@ -306,9 +307,11 @@ def _request_manual_captcha(site_url: str, timeout_minutes: int = 10,
         if resolved and _pending_captcha_token:
             token = _pending_captcha_token
             print(f"[CAPTCHA] ✅ Token erhalten! ({token[:30]}...)")
+            _delete_captcha_telegram_alert(captcha_message_id)
             return {"ok": True, "token": token, "error": ""}
         else:
             print("[CAPTCHA] ❌ Timeout – keine Lösung erhalten.")
+            _delete_captcha_telegram_alert(captcha_message_id)
             _send_telegram_alert(f"⏰ <b>Captcha-Timeout!</b>\nKeine Lösung innerhalb von {timeout_minutes} Minuten erhalten.")
             return {"ok": False, "token": "", "error": f"Captcha-Timeout nach {timeout_minutes} Minuten – keine manuelle Lösung erhalten"}
     except Exception as e:
@@ -706,6 +709,36 @@ def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: s
     if not cookie:
         return {"ok": False, "error": "Keine Cookie vorhanden", "fresh_cf_clearance": ""}
 
+    # Wie beim früheren Verhalten gilt ein von Jackett selbst gemeldeter
+    # negativer Indexer-Test als sofortiger Anlass für einen neuen Login.
+    # Transport-/HTTP-Fehler sind dagegen kein negativer Test und bewahren die
+    # bestehende Session.
+    try:
+        jackett_url = _config.get("jackett_url", "")
+        jackett_api_key = _config.get("jackett_api_key", "")
+        jackett_admin_password = _config.get("jackett_admin_password", "")
+        indexer_id = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
+        if jackett_url and jackett_api_key:
+            session = _get_jackett_session(jackett_url, jackett_admin_password)
+            resp = session.get(
+                f"{jackett_url.rstrip('/')}/api/v2.0/indexers/{indexer_id}/results",
+                params={"apikey": jackett_api_key, "Query": "test", "Type": "search"},
+                timeout=30,
+            )
+            if resp.ok:
+                for indexer in (resp.json().get("Indexers") or []):
+                    error = str(indexer.get("Error") or "").strip()
+                    if error:
+                        short_error = error.split("\n", 1)[0][:160]
+                        print(f"[COOKIE] ❌ Jackett-Test negativ: {short_error}")
+                        return {
+                            "ok": False,
+                            "error": f"Jackett-Test negativ: {short_error}",
+                            "fresh_cf_clearance": "",
+                        }
+    except Exception as exc:
+        print(f"[COOKIE] ⚠️ Jackett-Test nicht auswertbar – Cookie bleibt erhalten: {exc}")
+
     if not flaresolverr_url:
         return {
             "ok": True,
@@ -895,7 +928,7 @@ def _send_telegram_alert(message: str):
         enabled = _config.get("telegram_enabled", True)
         if not token or not chat_id or not enabled:
             print(f"[TELEGRAM] Übersprungen (enabled={enabled}, token={'ja' if token else 'NEIN'}, chat_id={'ja' if chat_id else 'NEIN'})")
-            return
+            return None
         resp = requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
             json={"chat_id": chat_id, "text": f"🍪 Turk ARR Bridge\n\n{message}", "parse_mode": "HTML"},
@@ -903,10 +936,53 @@ def _send_telegram_alert(message: str):
         )
         if resp.ok:
             print(f"[TELEGRAM] ✅ Nachricht gesendet")
+            try:
+                return resp.json().get("result", {}).get("message_id")
+            except Exception:
+                return None
         else:
             print(f"[TELEGRAM] ❌ API-Fehler: {resp.status_code} – {resp.text[:150]}")
     except Exception as e:
         print(f"[TELEGRAM] Alert fehlgeschlagen: {e}")
+    return None
+
+
+def _delete_captcha_telegram_alert(message_id=None):
+    """Löscht ausschließlich die zuletzt gespeicherte Captcha-Anforderung."""
+    configured_id = _config.get("telegram_last_captcha_message_id", "")
+    target_id = message_id or configured_id
+    if not target_id:
+        return
+
+    token = _config.get("telegram_bot_token", "")
+    chat_id = _config.get("telegram_chat_id", "")
+    if token and chat_id:
+        try:
+            resp = requests.post(
+                f"https://api.telegram.org/bot{token}/deleteMessage",
+                json={"chat_id": chat_id, "message_id": int(target_id)},
+                timeout=10,
+            )
+            if resp.ok:
+                print(f"[TELEGRAM] 🧹 Alte Captcha-Nachricht gelöscht")
+            else:
+                print(f"[TELEGRAM] ⚠️ Captcha-Nachricht konnte nicht gelöscht werden: HTTP {resp.status_code}")
+        except Exception as exc:
+            print(f"[TELEGRAM] ⚠️ Captcha-Nachricht konnte nicht gelöscht werden: {exc}")
+
+    if str(_config.get("telegram_last_captcha_message_id", "")) == str(target_id):
+        _config["telegram_last_captcha_message_id"] = ""
+        _save_config(_config)
+
+
+def _send_captcha_telegram_alert(message: str):
+    """Ersetzt die alte Captcha-Anforderung durch genau eine aktuelle."""
+    _delete_captcha_telegram_alert()
+    message_id = _send_telegram_alert(message)
+    if message_id:
+        _config["telegram_last_captcha_message_id"] = str(message_id)
+        _save_config(_config)
+    return message_id
 
 
 def _do_cookie_refresh(force_login: bool = False):
@@ -1014,10 +1090,6 @@ def _cookie_refresh_loop():
             flaresolverr_url = _config.get("flaresolverr_url", "")
             site_url = _config.get("turktorrent_site_url", "https://turktorrent.us")
             current_cookie = _config.get("turktorrent_current_cookie", "")
-            refresh_interval = int(_config.get("turktorrent_cookie_interval_minutes", 120) or 120)
-            last_refresh = _config.get("turktorrent_last_cookie_refresh", "")
-            last_check = _config.get("turktorrent_last_cookie_check", "")
-
             if not (enabled and username and password and flaresolverr_url):
                 time.sleep(CHECK_INTERVAL)
                 continue
@@ -1026,11 +1098,6 @@ def _cookie_refresh_loop():
             if _captcha_request_active:
                 print(f"[COOKIE] ⏳ Captcha-Request läuft, warte...")
                 time.sleep(60)  # kürzeres Intervall, damit wir schnell reagieren
-                continue
-
-            if current_cookie and not _cookie_refresh_due(last_check or last_refresh, refresh_interval):
-                print(f"[COOKIE] ⏳ Cookie noch innerhalb des Prüfintervalls ({refresh_interval} Min) – keine Re-Validierung nötig")
-                time.sleep(CHECK_INTERVAL)
                 continue
 
             # Cookie validieren
