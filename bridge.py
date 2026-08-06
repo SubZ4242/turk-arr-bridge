@@ -74,6 +74,7 @@ _DEFAULT_CONFIG = {
     "turktorrent_cookie_status": "",
     "turktorrent_current_cookie": "",
     "telegram_last_captcha_message_id": "",
+    "telegram_session_expired_message_id": "",
     "bridge_external_url": "",
     "flaresolverr_url": "",
     "arr_indexer_auto_heal": True,
@@ -985,6 +986,103 @@ def _send_captcha_telegram_alert(message: str):
     return message_id
 
 
+def _send_session_expired_alert(reason: str = ""):
+    """Sendet und pinnt genau eine Aufforderung zum manuellen Login-Start."""
+    existing_id = _config.get("telegram_session_expired_message_id", "")
+    if existing_id:
+        print(f"[TELEGRAM] Session-Warnung bereits vorhanden (message_id={existing_id})")
+        return existing_id
+
+    # Ein beim Neustart eventuell noch sichtbarer Captcha-Dialog ist nicht mehr
+    # lösbar. Entferne ihn, bevor die dauerhafte Ablaufwarnung gesendet wird.
+    _delete_captcha_telegram_alert()
+
+    request_id = int(time.time())
+    internal_host = _get_internal_bridge_url().rstrip("/")
+    external_host = _normalize_bridge_url(_config.get("bridge_external_url", ""))
+    internal_url = f"{internal_host}/captcha?autostart=1&request={request_id}"
+    external_url = (
+        f"{external_host}/captcha?autostart=1&request={request_id}"
+        if external_host and external_host != internal_host else ""
+    )
+    links = (
+        f'🏠 <a href="{html_lib.escape(internal_url, quote=True)}">'
+        "Login intern / LAN starten</a>"
+    )
+    if external_url:
+        links += (
+            f'\n\n🌍 <a href="{html_lib.escape(external_url, quote=True)}">'
+            "Login extern / Tailscale starten</a>"
+        )
+
+    message_id = _send_telegram_alert(
+        "⚠️ <b>TurkTorrent-Session abgelaufen</b>\n\n"
+        "Die Bridge wartet auf dich und sendet nicht automatisch weitere Captchas.\n\n"
+        "Öffne einen Link, um genau eine neue Captcha-Anforderung zu starten:\n\n"
+        f"{links}"
+    )
+    if not message_id:
+        return None
+
+    _config["telegram_session_expired_message_id"] = str(message_id)
+    _save_config(_config)
+
+    token = _config.get("telegram_bot_token", "")
+    chat_id = _config.get("telegram_chat_id", "")
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{token}/pinChatMessage",
+            json={
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "disable_notification": False,
+            },
+            timeout=10,
+        )
+        if resp.ok:
+            print("[TELEGRAM] 📌 Session-Warnung angepinnt")
+        else:
+            print(f"[TELEGRAM] ⚠️ Session-Warnung konnte nicht angepinnt werden: HTTP {resp.status_code}")
+    except Exception as exc:
+        print(f"[TELEGRAM] ⚠️ Session-Warnung konnte nicht angepinnt werden: {exc}")
+    return message_id
+
+
+def _clear_session_expired_alert():
+    """Entpinnt und löscht die Session-Warnung nach erfolgreichem Login."""
+    message_id = _config.get("telegram_session_expired_message_id", "")
+    if not message_id:
+        return
+
+    token = _config.get("telegram_bot_token", "")
+    chat_id = _config.get("telegram_chat_id", "")
+    if token and chat_id:
+        try:
+            unpin = requests.post(
+                f"https://api.telegram.org/bot{token}/unpinChatMessage",
+                json={"chat_id": chat_id, "message_id": int(message_id)},
+                timeout=10,
+            )
+            if unpin.ok:
+                print("[TELEGRAM] 📌 Session-Warnung entpinnt")
+        except Exception as exc:
+            print(f"[TELEGRAM] ⚠️ Session-Warnung konnte nicht entpinnt werden: {exc}")
+
+        try:
+            deleted = requests.post(
+                f"https://api.telegram.org/bot{token}/deleteMessage",
+                json={"chat_id": chat_id, "message_id": int(message_id)},
+                timeout=10,
+            )
+            if deleted.ok:
+                print("[TELEGRAM] 🧹 Session-Warnung gelöscht")
+        except Exception as exc:
+            print(f"[TELEGRAM] ⚠️ Session-Warnung konnte nicht gelöscht werden: {exc}")
+
+    _config["telegram_session_expired_message_id"] = ""
+    _save_config(_config)
+
+
 def _do_cookie_refresh(force_login: bool = False):
     """Führt einen Cookie-Refresh durch: FlareSolverr Login → Jackett Update.
 
@@ -1014,6 +1112,7 @@ def _do_cookie_refresh(force_login: bool = False):
         validation = _validate_turktorrent_cookie(current_cookie, site_url, flaresolverr_url)
         if validation["ok"]:
             print(f"[COOKIE] Cookie noch gültig – kein Refresh nötig")
+            _clear_session_expired_alert()
             checked_at = datetime.now()
             _config["turktorrent_last_cookie_check"] = checked_at.isoformat()
             if validation.get("error"):
@@ -1050,6 +1149,11 @@ def _do_cookie_refresh(force_login: bool = False):
     _config["turktorrent_current_cookie"] = login_result["cookie"]
     _save_config(_config)
 
+    # Das Captcha wurde erfolgreich verarbeitet, der Tracker hat den Login
+    # bestätigt und der Cookie ist sicher gespeichert. Die Ablaufwarnung kann
+    # jetzt unabhängig von Jacketts anschließendem Config-Test verschwinden.
+    _clear_session_expired_alert()
+
     # Schritt 2: Jackett aktualisieren
     update_result = _update_jackett_indexer_cookie(login_result["cookie"], login_result["user_agent"])
     if not update_result["ok"]:
@@ -1075,13 +1179,11 @@ def _do_cookie_refresh(force_login: bool = False):
 
 
 def _cookie_refresh_loop():
-    """Hintergrund-Thread: Prüft alle 5 Min ob Cookie gültig, bei Ablauf sofort Login."""
+    """Prüft die Session und wartet nach Ablauf auf einen bewussten User-Start."""
     # Beim ersten Start kurz warten bis alles initialisiert ist
     time.sleep(30)
 
     CHECK_INTERVAL = 300  # alle 5 Minuten prüfen
-    _last_captcha_request = 0  # Cooldown: nicht ständig Telegram spammen
-
     while True:
         try:
             enabled = _config.get("turktorrent_cookie_auto_refresh", True)
@@ -1105,6 +1207,7 @@ def _cookie_refresh_loop():
                 validation = _validate_turktorrent_cookie(current_cookie, site_url, flaresolverr_url)
                 if validation["ok"]:
                     # Cookie noch gültig → nichts tun
+                    _clear_session_expired_alert()
                     checked_at = datetime.now()
                     _config["turktorrent_last_cookie_check"] = checked_at.isoformat()
                     if validation.get("error"):
@@ -1122,19 +1225,11 @@ def _cookie_refresh_loop():
                 _config["turktorrent_cookie_status"] = f"⚠️ Cookie abgelaufen: {validation['error']}"
                 _save_config(_config)
 
-            # Cooldown: nur alle 15 Min ein neues Captcha anfordern (nicht spammen)
-            now = time.time()
-            if now - _last_captcha_request < 900:  # 15 Min Cooldown
-                remaining = int((900 - (now - _last_captcha_request)) / 60)
-                print(f"[COOKIE] Captcha-Cooldown aktiv, nächster Versuch in ~{remaining} Min")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            _last_captcha_request = now
-
-            # Login-Versuch starten (wird Telegram-Captcha anfordern)
-            with _cookie_refresh_lock:
-                _do_cookie_refresh()
+            # Kein automatischer Login und damit keine Captcha-Schleife. Eine
+            # einzelne angepinnte Telegram-Nachricht wartet auf den User.
+            _send_session_expired_alert(
+                validation.get("error", "") if current_cookie else "Kein Cookie vorhanden"
+            )
 
             time.sleep(CHECK_INTERVAL)
         except Exception as e:
@@ -5697,6 +5792,7 @@ def captcha_page():
     sitekey = _pending_captcha_sitekey or _DEFAULT_TURKTORRENT_HCAPTCHA_SITEKEY
     captcha_host = _pending_captcha_host or "turktorrent.us"
     active = _captcha_request_active
+    autostart = request.args.get("autostart") == "1"
     captcha_api_url = "https://hcaptcha.com/1/api.js?" + urllib.parse.urlencode({
         "hl": "tr",
         # Die Originalseite lädt dasselbe Sitekey ausdrücklich für diesen Host.
@@ -5868,9 +5964,14 @@ setTimeout(function() {
   }
 }, 12000);
 {% endif %}
+
+{% if autostart and not active %}
+// Der Link aus der angepinnten Session-Warnung startet genau einen Login.
+setTimeout(requestNewCaptcha, 250);
+{% endif %}
 </script>
 {% if active %}<script src="{{ captcha_api_url }}" async defer onerror="showCaptchaError('hCaptcha-Netzwerkdatei blockiert.')"></script>{% endif %}
-</body></html>""", sitekey=sitekey, captcha_api_url=captcha_api_url, active=active)
+</body></html>""", sitekey=sitekey, captcha_api_url=captcha_api_url, active=active, autostart=autostart)
     response = Response(html, content_type="text/html; charset=UTF-8")
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"

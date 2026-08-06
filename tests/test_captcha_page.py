@@ -71,6 +71,13 @@ class CaptchaPageCompatibilityTests(unittest.TestCase):
             response = bridge.app.test_client().get("/captcha-status")
         self.assertIn("no-store", response.headers["Cache-Control"])
 
+    def test_session_alert_link_autostarts_one_captcha_request(self):
+        with bridge.app.test_client() as client:
+            response = client.get("/captcha?autostart=1&request=123")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b"setTimeout(requestNewCaptcha, 250)", response.data)
+
     def test_telegram_message_contains_internal_and_optional_external_links(self):
         bridge._config["bridge_external_url"] = "http://100.79.56.23:9696/"
         with patch.object(
@@ -288,6 +295,85 @@ class TelegramCaptchaCleanupTests(unittest.TestCase):
                 bridge._config.pop("telegram_last_captcha_message_id", None)
             else:
                 bridge._config["telegram_last_captcha_message_id"] = old_id
+
+    def test_session_expired_alert_is_sent_once_and_pinned(self):
+        saved = {
+            key: bridge._config.get(key)
+            for key in (
+                "telegram_session_expired_message_id",
+                "telegram_bot_token",
+                "telegram_chat_id",
+                "bridge_external_url",
+            )
+        }
+        bridge._config.update({
+            "telegram_session_expired_message_id": "",
+            "telegram_bot_token": "bot-token",
+            "telegram_chat_id": "1234",
+            "bridge_external_url": "http://100.79.56.23:9696",
+        })
+        pin_response = Mock(ok=True)
+        try:
+            with patch.object(bridge, "_delete_captcha_telegram_alert") as delete_captcha, patch.object(
+                bridge, "_send_telegram_alert", return_value=202
+            ) as send, patch.object(
+                bridge, "_get_internal_bridge_url", return_value="http://192.168.1.50:9696"
+            ), patch.object(
+                bridge.requests, "post", return_value=pin_response
+            ) as telegram_post, patch.object(bridge, "_save_config"):
+                first = bridge._send_session_expired_alert("login failed")
+                second = bridge._send_session_expired_alert("login failed again")
+
+            self.assertEqual(first, 202)
+            self.assertEqual(second, "202")
+            delete_captcha.assert_called_once_with()
+            send.assert_called_once()
+            message = send.call_args.args[0]
+            self.assertIn("Session abgelaufen", message)
+            self.assertIn("autostart=1", message)
+            self.assertIn("100.79.56.23", message)
+            telegram_post.assert_called_once()
+            self.assertTrue(telegram_post.call_args.args[0].endswith("/pinChatMessage"))
+            self.assertFalse(telegram_post.call_args.kwargs["json"]["disable_notification"])
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    bridge._config.pop(key, None)
+                else:
+                    bridge._config[key] = value
+
+    def test_successful_login_unpins_and_deletes_session_alert(self):
+        saved = {
+            key: bridge._config.get(key)
+            for key in (
+                "telegram_session_expired_message_id",
+                "telegram_bot_token",
+                "telegram_chat_id",
+            )
+        }
+        bridge._config.update({
+            "telegram_session_expired_message_id": "303",
+            "telegram_bot_token": "bot-token",
+            "telegram_chat_id": "1234",
+        })
+        response = Mock(ok=True)
+        try:
+            with patch.object(bridge.requests, "post", return_value=response) as post, patch.object(
+                bridge, "_save_config"
+            ) as save:
+                bridge._clear_session_expired_alert()
+
+            self.assertEqual(post.call_count, 2)
+            self.assertTrue(post.call_args_list[0].args[0].endswith("/unpinChatMessage"))
+            self.assertTrue(post.call_args_list[1].args[0].endswith("/deleteMessage"))
+            self.assertEqual(bridge._config["telegram_session_expired_message_id"], "")
+            save.assert_called_once()
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    bridge._config.pop(key, None)
+                else:
+                    bridge._config[key] = value
 
 
 if __name__ == "__main__":
