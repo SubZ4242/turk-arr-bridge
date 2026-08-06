@@ -1,6 +1,6 @@
 import os
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 
 os.environ.setdefault("CONFIG_FILE", "/tmp/turk-arr-bridge-test-config.json")
@@ -158,6 +158,77 @@ class CaptchaPageCompatibilityTests(unittest.TestCase):
         validate.assert_not_called()
         login.assert_called_once()
         self.assertIn("test stopped", result["error"])
+
+
+class TurkTorrentCookiePersistenceTests(unittest.TestCase):
+    @staticmethod
+    def _flaresolverr_response(page_html):
+        response = Mock()
+        response.ok = True
+        response.json.return_value = {
+            "status": "ok",
+            "solution": {"response": page_html},
+        }
+        return response
+
+    @patch("bridge.requests.post")
+    def test_explicit_tsue_guest_response_expires_cookie(self, post):
+        post.return_value = self._flaresolverr_response(
+            '<script>var TSUE = {memberid: "0", membername: "Guest"};</script>'
+        )
+
+        result = bridge._validate_turktorrent_cookie(
+            "tsue_member=remember-me-token",
+            "https://turktorrent.us",
+            "http://flaresolverr:8191",
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertIn("memberid=0", result["error"])
+        sent_cookie = post.call_args.kwargs["json"]["cookies"][0]
+        self.assertEqual(sent_cookie["name"], "tsue_member")
+        self.assertEqual(sent_cookie["value"], "remember-me-token")
+
+    @patch("bridge.requests.post")
+    def test_authenticated_tsue_response_keeps_cookie(self, post):
+        post.return_value = self._flaresolverr_response(
+            '<script>var TSUE = {memberid: "42", membername: "Halil"};</script>'
+        )
+
+        result = bridge._validate_turktorrent_cookie(
+            "tsue_member=remember-me-token",
+            "https://turktorrent.us",
+            "http://flaresolverr:8191",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["error"], "")
+
+    @patch("bridge.requests.post", side_effect=TimeoutError("temporary outage"))
+    def test_probe_failure_never_expires_saved_cookie(self, _post):
+        result = bridge._validate_turktorrent_cookie(
+            "tsue_member=remember-me-token",
+            "https://turktorrent.us",
+            "http://flaresolverr:8191",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("bleibt erhalten", result["error"])
+
+    @patch("bridge.requests.post")
+    def test_ambiguous_html_never_expires_saved_cookie(self, post):
+        post.return_value = self._flaresolverr_response(
+            '<html><form id="loginbox_form"></form></html>'
+        )
+
+        result = bridge._validate_turktorrent_cookie(
+            "tsue_member=remember-me-token",
+            "https://turktorrent.us",
+            "http://flaresolverr:8191",
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertIn("bleibt erhalten", result["error"])
 
 
 if __name__ == "__main__":

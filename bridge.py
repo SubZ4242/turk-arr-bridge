@@ -19,6 +19,7 @@ import json
 import html as html_lib
 import urllib.parse
 import threading
+from http.cookies import SimpleCookie
 from typing import Optional
 from datetime import datetime, timedelta
 from email.utils import format_datetime
@@ -69,6 +70,7 @@ _DEFAULT_CONFIG = {
     "jackett_admin_password": "",
     "turktorrent_jackett_indexer_id": "turktorrent",
     "turktorrent_last_cookie_refresh": "",
+    "turktorrent_last_cookie_check": "",
     "turktorrent_cookie_status": "",
     "turktorrent_current_cookie": "",
     "bridge_external_url": "",
@@ -692,80 +694,102 @@ def _cookie_refresh_due(last_refresh_iso: str, interval_minutes: int) -> bool:
 
 def _validate_turktorrent_cookie(cookie: str, site_url: str, flaresolverr_url: str = "") -> dict:
     """
-    Prüft ob der TurkTorrent-Indexer in Jackett funktioniert.
-    Strategie: Einen echten Jackett-Test machen (Suche + Download).
-    Wenn Jackett Torrents liefern kann, ist der Cookie gültig – egal was
-    unsere eigene Homepage-Prüfung sagt (Jackett hat eigenen FlareSolverr).
+    Prüft den gespeicherten Cookie direkt und rein lesend bei TurkTorrent.
+
+    Ausschließlich eine eindeutige TSUE-Gastantwort (memberid=0 UND
+    membername=Guest) macht den Cookie ungültig. Netzwerk-, Cloudflare-,
+    FlareSolverr-, HTML- oder Jackettfehler dürfen keinen Captcha-Login
+    auslösen. Dadurch bleibt eine einmal erfolgreiche Session dauerhaft
+    gespeichert, bis der Tracker selbst bestätigt, dass sie abgelaufen ist.
     Gibt {"ok": bool, "error": str, "fresh_cf_clearance": str} zurück.
     """
     if not cookie:
         return {"ok": False, "error": "Keine Cookie vorhanden", "fresh_cf_clearance": ""}
 
-    # ── Primäre Prüfung: Jackett fragen ob der Indexer funktioniert ──
+    if not flaresolverr_url:
+        return {
+            "ok": True,
+            "error": "FlareSolverr nicht konfiguriert – gespeicherter Cookie bleibt erhalten",
+            "fresh_cf_clearance": "",
+        }
+
     try:
-        jackett_url = _config.get("jackett_url", "")
-        jackett_api_key = _config.get("jackett_api_key", "")
-        jackett_admin_password = _config.get("jackett_admin_password", "")
-        indexer_id = _config.get("turktorrent_jackett_indexer_id", "turktorrent")
+        parsed_site = urllib.parse.urlparse(site_url)
+        cookie_jar = SimpleCookie()
+        cookie_jar.load(cookie)
+        fs_cookies = [
+            {
+                "name": morsel.key,
+                "value": morsel.value,
+                "domain": parsed_site.hostname or "turktorrent.us",
+                "path": "/",
+            }
+            for morsel in cookie_jar.values()
+        ]
+        if not fs_cookies:
+            return {
+                "ok": True,
+                "error": "Cookie konnte nicht gelesen werden – gespeicherter Wert bleibt erhalten",
+                "fresh_cf_clearance": "",
+            }
 
-        if jackett_url and jackett_api_key:
-            # Jackett-Suche: Hole ein Ergebnis und prüfe ob Download klappt
-            session = _get_jackett_session(jackett_url, jackett_admin_password)
-            search_url = f"{jackett_url.rstrip('/')}/api/v2.0/indexers/{indexer_id}/results"
-            resp = session.get(search_url, params={
-                "apikey": jackett_api_key,
-                "Query": "test",
-                "Type": "search",
-            }, timeout=30)
+        resp = requests.post(
+            f"{flaresolverr_url.rstrip('/')}/v1",
+            json={
+                "cmd": "request.get",
+                "url": site_url.rstrip("/") + "/",
+                "cookies": fs_cookies,
+                "maxTimeout": 30000,
+            },
+            timeout=40,
+        )
+        if not resp.ok:
+            return {
+                "ok": True,
+                "error": f"Cookie-Prüfung HTTP {resp.status_code} unklar – Cookie bleibt erhalten",
+                "fresh_cf_clearance": "",
+            }
 
-            if resp.ok:
-                data = resp.json()
-                results = data.get("Results", [])
-                indexers = data.get("Indexers", [])
+        payload = resp.json()
+        if payload.get("status") != "ok":
+            return {
+                "ok": True,
+                "error": "Cookie-Prüfung durch FlareSolverr unklar – Cookie bleibt erhalten",
+                "fresh_cf_clearance": "",
+            }
 
-                # ── Zuerst: Prüfe ob Jackett einen Indexer-Fehler meldet ──
-                # Jackett gibt Fehler im Indexers[]-Array zurück (z.B. "Login failed")
-                for idx_info in indexers:
-                    idx_error = idx_info.get("Error", "")
-                    if idx_error:
-                        # Login-Fehler → Cookie ist definitiv ungültig
-                        short_err = idx_error.split("\n")[0][:120]  # Erste Zeile, max 120 Zeichen
-                        print(f"[COOKIE] ❌ Jackett Indexer-Fehler: {short_err}")
-                        return {"ok": False, "error": f"Jackett: {short_err}", "fresh_cf_clearance": ""}
+        solution = payload.get("solution") or {}
+        page_html = solution.get("response") or ""
+        member_id_match = re.search(r'memberid:\s*["\']([^"\']+)["\']', page_html, re.IGNORECASE)
+        member_name_match = re.search(r'membername:\s*["\']([^"\']+)["\']', page_html, re.IGNORECASE)
+        member_id = member_id_match.group(1).strip() if member_id_match else ""
+        member_name = member_name_match.group(1).strip() if member_name_match else ""
 
-                if len(results) > 0:
-                    # Versuche einen Torrent herunterzuladen
-                    dl_url = results[0].get("Link", "")
-                    if dl_url:
-                        dl_resp = session.get(dl_url, timeout=15, allow_redirects=True)
-                        ct = dl_resp.headers.get("Content-Type", "").lower()
-                        if "torrent" in ct or "octet" in ct:
-                            print(f"[COOKIE] ✅ Jackett-Test OK: {len(results)} Ergebnisse, Download funktioniert ({len(dl_resp.content)} bytes)")
-                            return {"ok": True, "error": "", "fresh_cf_clearance": ""}
-                        else:
-                            print(f"[COOKIE] ⚠️ Jackett-Download fehlgeschlagen: Content-Type={ct}")
-                            return {"ok": False, "error": f"Jackett-Download fehlgeschlagen (Content-Type: {ct})", "fresh_cf_clearance": ""}
-                    else:
-                        # Ergebnisse vorhanden aber kein Download-Link → trotzdem OK
-                        print(f"[COOKIE] ✅ Jackett-Test OK: {len(results)} Ergebnisse (kein DL-Link zum Testen)")
-                        return {"ok": True, "error": "", "fresh_cf_clearance": ""}
-                else:
-                    # Keine Ergebnisse und kein Fehler → Cookie vermutlich OK
-                    # (Suchbegriff hat einfach nichts gefunden)
-                    print(f"[COOKIE] ✅ Jackett erreichbar, keine Fehler (0 Ergebnisse für 'test')")
-                    return {"ok": True, "error": "", "fresh_cf_clearance": ""}
-            else:
-                print(f"[COOKIE] ⚠️ Jackett-Suche HTTP {resp.status_code}")
-                # Jackett nicht erreichbar → können nicht prüfen → als OK behandeln
-                return {"ok": True, "error": f"Jackett nicht erreichbar (HTTP {resp.status_code})", "fresh_cf_clearance": ""}
+        if member_id == "0" and member_name.casefold() == "guest":
+            print("[COOKIE] ❌ TurkTorrent bestätigt eindeutige Gast-Session")
+            return {
+                "ok": False,
+                "error": "TurkTorrent meldet memberid=0 und membername=Guest",
+                "fresh_cf_clearance": "",
+            }
+
+        if _check_tsue_logged_in(page_html):
+            print(f"[COOKIE] ✅ TurkTorrent bestätigt aktive Session (memberid={member_id}, membername={member_name})")
+            return {"ok": True, "error": "", "fresh_cf_clearance": ""}
+
+        print("[COOKIE] ⚠️ Tracker-Antwort nicht eindeutig – gespeicherter Cookie bleibt erhalten")
+        return {
+            "ok": True,
+            "error": "Tracker-Antwort unklar – Cookie bleibt erhalten",
+            "fresh_cf_clearance": "",
+        }
     except Exception as e:
-        print(f"[COOKIE] ⚠️ Jackett-Validierung fehlgeschlagen: {e}")
-        # Bei Fehler: nicht als "abgelaufen" melden → kein unnötiges Captcha
-        return {"ok": True, "error": f"Jackett-Prüfung fehlgeschlagen: {str(e)[:80]}", "fresh_cf_clearance": ""}
-
-    # Fallback wenn Jackett nicht konfiguriert: Cookie als gültig behandeln
-    # (besser kein unnötiges Captcha als ständig nerven)
-    return {"ok": True, "error": "Jackett nicht konfiguriert – Cookie-Status unklar", "fresh_cf_clearance": ""}
+        print(f"[COOKIE] ⚠️ Direkte Cookie-Prüfung fehlgeschlagen: {e}")
+        return {
+            "ok": True,
+            "error": f"Cookie-Prüfung unklar – Cookie bleibt erhalten ({str(e)[:80]})",
+            "fresh_cf_clearance": "",
+        }
 
 
 def _get_jackett_session(jackett_url: str, admin_password: str) -> requests.Session:
@@ -914,7 +938,12 @@ def _do_cookie_refresh(force_login: bool = False):
         validation = _validate_turktorrent_cookie(current_cookie, site_url, flaresolverr_url)
         if validation["ok"]:
             print(f"[COOKIE] Cookie noch gültig – kein Refresh nötig")
-            _config["turktorrent_cookie_status"] = f"✅ Cookie gültig (geprüft {datetime.now().strftime('%d.%m.%Y %H:%M')})"
+            checked_at = datetime.now()
+            _config["turktorrent_last_cookie_check"] = checked_at.isoformat()
+            if validation.get("error"):
+                _config["turktorrent_cookie_status"] = f"⚠️ {validation['error']}"
+            else:
+                _config["turktorrent_cookie_status"] = f"✅ Cookie gültig (geprüft {checked_at.strftime('%d.%m.%Y %H:%M')})"
             _save_config(_config)
             return {"ok": True, "error": ""}
         print(f"[COOKIE] Cookie abgelaufen: {validation['error']}")
@@ -957,7 +986,9 @@ def _do_cookie_refresh(force_login: bool = False):
 
     msg = f"✅ Cookie erfolgreich aktualisiert ({datetime.now().strftime('%d.%m.%Y %H:%M')})"
     _config["turktorrent_cookie_status"] = msg
-    _config["turktorrent_last_cookie_refresh"] = datetime.now().isoformat()
+    refreshed_at = datetime.now().isoformat()
+    _config["turktorrent_last_cookie_refresh"] = refreshed_at
+    _config["turktorrent_last_cookie_check"] = refreshed_at
     _save_config(_config)
     print(f"[COOKIE] {msg}")
     _send_telegram_alert(f"✅ <b>Cookie erfolgreich aktualisiert!</b>\nJackett wurde mit neuen TurkTorrent-Cookies versorgt.")
@@ -985,6 +1016,7 @@ def _cookie_refresh_loop():
             current_cookie = _config.get("turktorrent_current_cookie", "")
             refresh_interval = int(_config.get("turktorrent_cookie_interval_minutes", 120) or 120)
             last_refresh = _config.get("turktorrent_last_cookie_refresh", "")
+            last_check = _config.get("turktorrent_last_cookie_check", "")
 
             if not (enabled and username and password and flaresolverr_url):
                 time.sleep(CHECK_INTERVAL)
@@ -996,8 +1028,8 @@ def _cookie_refresh_loop():
                 time.sleep(60)  # kürzeres Intervall, damit wir schnell reagieren
                 continue
 
-            if current_cookie and not _cookie_refresh_due(last_refresh, refresh_interval):
-                print(f"[COOKIE] ⏳ Cookie noch innerhalb des Refresh-Intervalls ({refresh_interval} Min) – keine Re-Validierung nötig")
+            if current_cookie and not _cookie_refresh_due(last_check or last_refresh, refresh_interval):
+                print(f"[COOKIE] ⏳ Cookie noch innerhalb des Prüfintervalls ({refresh_interval} Min) – keine Re-Validierung nötig")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
@@ -1006,8 +1038,14 @@ def _cookie_refresh_loop():
                 validation = _validate_turktorrent_cookie(current_cookie, site_url, flaresolverr_url)
                 if validation["ok"]:
                     # Cookie noch gültig → nichts tun
-                    print(f"[COOKIE] ✅ Cookie gültig (Check {datetime.now().strftime('%H:%M')})")
-                    _config["turktorrent_cookie_status"] = f"✅ Cookie gültig (geprüft {datetime.now().strftime('%d.%m.%Y %H:%M')})"
+                    checked_at = datetime.now()
+                    _config["turktorrent_last_cookie_check"] = checked_at.isoformat()
+                    if validation.get("error"):
+                        print(f"[COOKIE] ⚠️ {validation['error']}")
+                        _config["turktorrent_cookie_status"] = f"⚠️ {validation['error']}"
+                    else:
+                        print(f"[COOKIE] ✅ Cookie gültig (Check {checked_at.strftime('%H:%M')})")
+                        _config["turktorrent_cookie_status"] = f"✅ Cookie gültig (geprüft {checked_at.strftime('%d.%m.%Y %H:%M')})"
                     _save_config(_config)
                     time.sleep(CHECK_INTERVAL)
                     continue
