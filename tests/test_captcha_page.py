@@ -46,6 +46,16 @@ class CaptchaPageCompatibilityTests(unittest.TestCase):
         self.assertFalse(dashboard_start < captcha_settings < telegram_start)
         self.assertTrue(telegram_start < captcha_settings < next_panel)
 
+    def test_jackett_login_uses_current_positive_logout_marker(self):
+        definition = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "jackett", "turktorrent.yml"
+        )
+        with open(definition, encoding="utf-8") as handle:
+            contents = handle.read()
+
+        self.assertIn("selector: a#logout", contents)
+        self.assertNotIn("body:not(:has(form#loginbox_form))", contents)
+
     def test_active_page_uses_tracker_host_and_same_origin_callbacks(self):
         bridge._captcha_request_active = True
         bridge._pending_captcha_sitekey = "dynamic-sitekey_12345678901234567890"

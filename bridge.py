@@ -73,6 +73,7 @@ _DEFAULT_CONFIG = {
     "turktorrent_last_cookie_check": "",
     "turktorrent_cookie_status": "",
     "turktorrent_current_cookie": "",
+    "turktorrent_current_user_agent": "",
     "telegram_last_captcha_message_id": "",
     "telegram_session_expired_message_id": "",
     "bridge_external_url": "",
@@ -1147,6 +1148,7 @@ def _do_cookie_refresh(force_login: bool = False):
     # selbst erfolgreich war. Ohne die fruehe Sicherung ging der gueltige Cookie
     # bisher verloren und der Auto-Refresh startete immer neue Captchas.
     _config["turktorrent_current_cookie"] = login_result["cookie"]
+    _config["turktorrent_current_user_agent"] = login_result["user_agent"]
     _save_config(_config)
 
     # Das Captcha wurde erfolgreich verarbeitet, der Tracker hat den Login

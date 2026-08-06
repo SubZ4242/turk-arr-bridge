@@ -114,14 +114,14 @@ settings:
       asc: asc
 
 login:
-  # Positive login marker. Keep this selector CSS-parser compatible: Jackett's
-  # Cardigann engine does not support the relational :has() pseudo-class.
+  # Stable positive login marker confirmed on the current classic frontend.
+  # Guests do not receive this element.
   method: cookie
   inputs:
     cookie: "{{ .Config.cookie }}"
   test:
     path: ?p=torrents&pid=10
-    selector: a[href*="action=logout"]
+    selector: a#logout
 
 search:
   headers:
